@@ -1,0 +1,23 @@
+[Unit]
+Description=SovaGrid Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sovagrid-hub
+Group=sovagrid-hub
+WorkingDirectory=/opt/sovagrid-hub
+ExecStart=/usr/bin/python3 -m sovagrid_hub --db /var/lib/sovagrid-hub/hub.sqlite serve --port 8765
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sovagrid-hub
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

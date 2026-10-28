@@ -1,0 +1,23 @@
+sovagrid.example.com {
+    header {
+        Content-Security-Policy "frame-ancestors 'none'"
+        X-Frame-Options "DENY"
+    }
+
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8765 {
+            # Overwrite the client-supplied value; Hub trusts this header from loopback.
+            header_up X-SovaGrid-Client-IP {remote_host}
+        }
+    }
+
+    handle /healthz {
+        reverse_proxy 127.0.0.1:8765
+    }
+
+    handle {
+        root * /var/www/sovagrid-web
+        try_files {path} /index.html
+        file_server
+    }
+}
