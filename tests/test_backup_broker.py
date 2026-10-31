@@ -3,6 +3,7 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 """The Web backup route cannot turn a lost reply into a second snapshot."""
 
+import copy
 import hashlib
 import http.client
 import io
@@ -27,7 +28,7 @@ from sovagrid_hub.backup_broker import (BackupBroker, _reap_streams, _request, h
                                         _stream_send)
 from sovagrid_hub.backup_client import (BackupBrokerClient, BackupClientError,
                                         HostBackupBrokerClient, _restore,
-                                        _host_portable_operation)
+                                        _host_portable_operation, _host_receipt)
 from sovagrid_hub.backup_restore import RestoreOrchestrator
 from sovagrid_hub.http_api import HubApp, make_server
 from sovagrid_hub.store import Store
@@ -58,6 +59,53 @@ HOST_RECEIPT = {
 }
 HOST_PORTABLE = {**HOST_OPERATION, "phase": "complete", "archive": HOST_ARCHIVE,
                  "image_receipt": HOST_RECEIPT}
+
+
+class PortableReceiptV2Tests(unittest.TestCase):
+    def receipt(self, *, layout="full"):
+        receipt = copy.deepcopy(HOST_RECEIPT)
+        receipt["protocol"] = "sovagrid-portable-host-receipt-v2"
+        agent = "sovagrid-agent.service" if layout == "full" else "sovagrid-agent-local.service"
+        receipt["active_units"] = ["sovagrid-release-feed.timer"]
+        receipt["unit_hashes"] = {"sovagrid-release-feed.timer": "b" * 64}
+        receipt["unit_states"] = {
+            agent: {"active": True, "enablement": "enabled", "sha256": "a" * 64},
+            "sovagrid-release-feed.timer": {
+                "active": True, "enablement": "disabled", "sha256": "b" * 64},
+        }
+        return receipt
+
+    def test_v1_remains_valid_and_v2_uses_archive_layout(self):
+        self.assertEqual(_host_receipt(HOST_RECEIPT, archive_id=HOST_ARCHIVE_ID), HOST_RECEIPT)
+        for layout in ("full", "hub-only"):
+            value = {**HOST_PORTABLE, "archive": {**HOST_ARCHIVE, "layout": layout},
+                     "image_receipt": self.receipt(layout=layout)}
+            self.assertEqual(_host_portable_operation(value), value)
+        with self.assertRaises(BackupClientError):
+            _host_receipt(self.receipt(), archive_id=HOST_ARCHIVE_ID, layout="hub-only")
+
+    def test_v2_rejects_unknown_state_and_unbound_writer_hashes(self):
+        valid = self.receipt()
+        mutations = (
+            lambda value: value["unit_states"].update({"sovagrid-unreviewed.service": {
+                "active": False, "enablement": "disabled", "sha256": "a" * 64}}),
+            lambda value: value["unit_states"]["sovagrid-agent.service"].update(active=1),
+            lambda value: value["unit_states"]["sovagrid-agent.service"].update(enablement="invalid"),
+            lambda value: value["unit_states"]["sovagrid-agent.service"].update(extra=True),
+            lambda value: value["unit_states"]["sovagrid-release-feed.timer"].update(sha256="c" * 64),
+            lambda value: value["unit_states"]["sovagrid-release-feed.timer"].update(active=False),
+            lambda value: value["unit_states"].pop("sovagrid-release-feed.timer"),
+            lambda value: value.update(active_units=[], unit_hashes={}),
+        )
+        for mutate in mutations:
+            value = copy.deepcopy(valid)
+            mutate(value)
+            with self.subTest(value=value):
+                with self.assertRaises(BackupClientError):
+                    _host_receipt(value, archive_id=HOST_ARCHIVE_ID, layout="full")
+        v1_with_states = {**valid, "protocol": HOST_RECEIPT["protocol"]}
+        with self.assertRaises(BackupClientError):
+            _host_receipt(v1_with_states, archive_id=HOST_ARCHIVE_ID, layout="full")
 
 
 def restore_record(target_id, *, phase="complete", hub_running=True):

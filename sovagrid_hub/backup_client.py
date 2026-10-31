@@ -38,6 +38,60 @@ HOST_PROTOCOL = "sovagrid-host-backup-operation-v1"
 HOST_MAX_BYTES = 8 * 1024**3
 HOST_COMPOSE_SERVICES = frozenset(("hub", "web", "ssh-gateway"))
 HOST_PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v1"
+HOST_PORTABLE_RECEIPT_V2 = "sovagrid-portable-host-receipt-v2"
+HOST_UNIT_ENABLEMENT = frozenset((
+    "enabled", "enabled-runtime", "disabled", "static", "indirect", "alias",
+    "masked", "masked-runtime", "linked", "linked-runtime", "generated", "transient",
+))
+# Exact unit-file sources archived by Blueprint; arbitrary systemd names are
+# never accepted as restore metadata.
+HOST_MANAGED_UNITS = {
+    "full": frozenset("""
+        sovagrid-agent.service sovagrid-amnezia-control.service sovagrid-amnezia-control.socket
+        sovagrid-auto-update.service sovagrid-auto-update.timer
+        sovagrid-container-inventory.service sovagrid-container-inventory.timer
+        sovagrid-hub-backup-control.service sovagrid-hub-backup-control.socket
+        sovagrid-journal-control.service sovagrid-journal-control.socket
+        sovagrid-release-feed.service sovagrid-release-feed.timer
+        sovagrid-service-control.service sovagrid-service-control.socket
+        sovagrid-terminal-control.service sovagrid-terminal-control.socket
+        sovagrid-vpn-control.service sovagrid-vpn-control.socket sovagrid-vpn-routing.service
+        sovagrid-vpn-status.service sovagrid-vpn-status.timer
+        sovagrid-web-agent-control.service sovagrid-web-agent-control.socket
+    """.split()),
+    "hub-only": frozenset("""
+        sovagrid-agent-local.service
+        sovagrid-container-inventory-local.service sovagrid-container-inventory-local.timer
+        sovagrid-external-agent-apply@.service sovagrid-external-agent-recovery.service
+        sovagrid-hub-backup-control.service sovagrid-hub-backup-control.socket
+        sovagrid-hub-only-update.service sovagrid-hub-only-update.timer
+        sovagrid-release-feed.service sovagrid-release-feed.timer
+        sovagrid-service-local-control.service sovagrid-service-local-control.socket
+        sovagrid-terminal-local-control.service sovagrid-terminal-local-control.socket
+        sovagrid-vpn-routing.service sovagrid-vpn-status.service sovagrid-vpn-status.timer
+        sovagrid-web-agent-control.service sovagrid-web-agent-control.socket
+    """.split()),
+}
+HOST_WRITER_UNITS = {
+    "full": frozenset("""
+        sovagrid-amnezia-control.service sovagrid-amnezia-control.socket
+        sovagrid-auto-update.service sovagrid-auto-update.timer
+        sovagrid-container-inventory.service sovagrid-container-inventory.timer
+        sovagrid-hub-backup-control.service sovagrid-hub-backup-control.socket
+        sovagrid-release-feed.service sovagrid-release-feed.timer
+        sovagrid-vpn-control.service sovagrid-vpn-control.socket
+        sovagrid-vpn-status.service sovagrid-vpn-status.timer
+        sovagrid-web-agent-control.service sovagrid-web-agent-control.socket
+    """.split()),
+    "hub-only": frozenset("""
+        sovagrid-container-inventory-local.service sovagrid-container-inventory-local.timer
+        sovagrid-hub-backup-control.service sovagrid-hub-backup-control.socket
+        sovagrid-hub-only-update.service sovagrid-hub-only-update.timer
+        sovagrid-release-feed.service sovagrid-release-feed.timer
+        sovagrid-vpn-status.service sovagrid-vpn-status.timer
+        sovagrid-web-agent-control.service sovagrid-web-agent-control.socket
+    """.split()),
+}
 HOST_PARTS = frozenset(("archive", "host_manifest", "images", "images_manifest",
                        "receipt"))
 
@@ -313,12 +367,16 @@ def _host_operation(value: object, *, identity: str | None = None) -> dict:
     return value
 
 
-def _host_receipt(value: object, *, archive_id: str | None = None) -> dict:
+def _host_receipt(value: object, *, archive_id: str | None = None,
+                  layout: str | None = None) -> dict:
     keys = {"protocol", "host_archive_id", "host_archive_sha256",
             "source_manifest_sha256", "images_sha256", "images", "container_ids",
             "exported_configs", "rootfs_sha256", "active_units", "unit_hashes"}
-    if (not isinstance(value, dict) or set(value) != keys or
-            value["protocol"] != HOST_PORTABLE_RECEIPT or
+    if not isinstance(value, dict):
+        raise BackupClientError(503, "Invalid portable backup broker reply")
+    v2 = value.get("protocol") == HOST_PORTABLE_RECEIPT_V2
+    if (set(value) != (keys | {"unit_states"} if v2 else keys) or
+            value["protocol"] not in (HOST_PORTABLE_RECEIPT, HOST_PORTABLE_RECEIPT_V2) or
             not _host_id(value["host_archive_id"]) or
             (archive_id is not None and value["host_archive_id"] != archive_id) or
             any(not isinstance(value[key], str) or HOST_SHA.fullmatch(value[key]) is None
@@ -344,6 +402,22 @@ def _host_receipt(value: object, *, archive_id: str | None = None) -> dict:
             any(not isinstance(digest, str) or HOST_SHA.fullmatch(digest) is None
                 for digest in value["unit_hashes"].values())):
         raise BackupClientError(503, "Invalid portable backup broker reply")
+    if v2:
+        states = value["unit_states"]
+        if (not isinstance(layout, str) or layout not in HOST_MANAGED_UNITS or
+                not isinstance(states, dict) or len(states) > 32 or
+                any(not isinstance(name, str) or name not in HOST_MANAGED_UNITS[layout] or
+                    not isinstance(state, dict) or set(state) != {"active", "enablement", "sha256"} or
+                    type(state["active"]) is not bool or
+                    not isinstance(state["enablement"], str) or state["enablement"] not in HOST_UNIT_ENABLEMENT or
+                    not isinstance(state["sha256"], str) or HOST_SHA.fullmatch(state["sha256"]) is None
+                    for name, state in states.items()) or
+                set(value["active_units"]) != {name for name, state in states.items()
+                                              if name in HOST_WRITER_UNITS[layout] and state["active"]} or
+                not set(value["unit_hashes"]).issubset(states) or
+                any(states[name]["sha256"] != digest for name, digest in value["unit_hashes"].items()) or
+                len(json.dumps(value, separators=(",", ":")).encode("utf-8")) + 1 > 8192):
+            raise BackupClientError(503, "Invalid portable backup broker reply")
     return value
 
 
@@ -356,7 +430,8 @@ def _host_portable_operation(value: object, *, identity: str | None = None) -> d
     if (operation["phase"] == "complete") != (receipt is not None):
         raise BackupClientError(503, "Invalid portable backup broker reply")
     if receipt is not None:
-        _host_receipt(receipt, archive_id=operation["archive"]["id"])
+        _host_receipt(receipt, archive_id=operation["archive"]["id"],
+                      layout=operation["archive"]["layout"])
     return value
 
 
@@ -499,7 +574,7 @@ class HostBackupBrokerClient(BackupBrokerClient):
                 not 0 < value["images_bytes"] <= HOST_MAX_BYTES):
             raise BackupClientError(503, "Invalid portable backup broker reply")
         checked_archive = _host_archive(archive)
-        _host_receipt(receipt, archive_id=checked_archive["id"])
+        _host_receipt(receipt, archive_id=checked_archive["id"], layout=checked_archive["layout"])
         return value
 
     def open_portable_stream(self, request_id: str, part: str, *,
