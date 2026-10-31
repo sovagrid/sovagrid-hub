@@ -784,18 +784,18 @@ def _peer_uid(connection: socket.socket) -> int:
     return uid
 
 
-def _reap_streams(children: set[int]) -> None:
+def _reap_streams(children: dict[int, tuple[str, str] | None]) -> None:
     for pid in tuple(children):
         try:
             finished, _ = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             finished = pid
         if finished:
-            children.discard(pid)
+            children.pop(pid, None)
 
 
 def handle(connection: socket.socket, broker: BackupBroker, *,
-           stream_children: set[int] | None = None,
+           stream_children: dict[int, tuple[str, str] | None] | None = None,
            listener: socket.socket | None = None) -> None:
     connection.settimeout(10)
     try:
@@ -819,11 +819,15 @@ def handle(connection: socket.socket, broker: BackupBroker, *,
                         payload, cancel_connection=connection)))
                 return
             _reap_streams(stream_children)
+            stream_key = ((payload["request_id"], payload["part"])
+                          if payload["action"] == "host_portable_stream" else None)
+            if stream_key is not None and stream_key in tuple(stream_children.values()):
+                raise BackupError("HOST_STREAM_ACTIVE")
             if len(stream_children) >= MAX_STREAM_CHILDREN or listener is None:
                 raise BackupError("HOST_STREAM_BUSY")
             pid = os.fork()
             if pid:
-                stream_children.add(pid)
+                stream_children[pid] = stream_key
                 return
             # A streaming child only owns this accepted connection. The root
             # broker keeps accepting normal control requests independently.
@@ -871,7 +875,9 @@ def main() -> None:
     if listener.getsockname() != str(SOCKET_PATH):
         raise SystemExit("unexpected socket path")
     broker = BackupBroker()
-    stream_children: set[int] = set()
+    # The socket-accepting parent is the only writer. A child owns its key
+    # until SIGCHLD reaps it, including client disconnects and worker crashes.
+    stream_children: dict[int, tuple[str, str] | None] = {}
     signal.signal(signal.SIGCHLD, lambda _signal, _frame: _reap_streams(stream_children))
     while True:
         connection, _ = listener.accept()

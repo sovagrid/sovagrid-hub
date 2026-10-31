@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sovagrid_hub.backup import BackupError, HubBackups, Layout
-from sovagrid_hub.backup_broker import (BackupBroker, _request, handle,
+from sovagrid_hub.backup_broker import (BackupBroker, _reap_streams, _request, handle,
                                         _host_command_cancellable, _host_execute,
                                         _stream_send)
 from sovagrid_hub.backup_client import (BackupBrokerClient, BackupClientError,
@@ -392,7 +392,7 @@ class BackupBrokerTests(unittest.TestCase):
             listener.close()
 
     def test_stream_capacity_does_not_block_control_request(self):
-        children = {101, 102}
+        children = {101: None, 102: None}
         payload = {"action": "host_portable_stream", "request_id": HOST_REQUEST_ID,
                    "part": "archive"}
         caller, server = socket.socketpair()
@@ -417,6 +417,74 @@ class BackupBrokerTests(unittest.TestCase):
         finally:
             caller.close()
             server.close()
+
+    def test_portable_stream_key_rejects_duplicates_and_reaps_on_child_exit(self):
+        active = (HOST_REQUEST_ID, "archive")
+        children = {101: active}
+        listener = mock.Mock(spec=socket.socket)
+        caller, server = socket.socketpair()
+        try:
+            caller.sendall((json.dumps({"action": "host_portable_stream",
+                                        "request_id": HOST_REQUEST_ID,
+                                        "part": "archive"}) + "\n").encode())
+            with mock.patch("sovagrid_hub.backup_broker._peer_uid", return_value=10001), \
+                 mock.patch("sovagrid_hub.backup_broker._reap_streams"), \
+                 mock.patch("sovagrid_hub.backup_broker.os.fork") as fork:
+                handle(server, self.broker, stream_children=children, listener=listener)
+            self.assertEqual(json.loads(caller.recv(1024))["error"], "HOST_STREAM_ACTIVE")
+            fork.assert_not_called()
+        finally:
+            caller.close()
+            server.close()
+
+        for request_id, part in ((HOST_REQUEST_ID, "images"), ("d" * 32, "archive")):
+            with self.subTest(request_id=request_id, part=part):
+                children = {101: active}
+                caller, server = socket.socketpair()
+                try:
+                    caller.sendall((json.dumps({"action": "host_portable_stream",
+                                                "request_id": request_id,
+                                                "part": part}) + "\n").encode())
+                    with mock.patch("sovagrid_hub.backup_broker._peer_uid",
+                                    return_value=10001), \
+                         mock.patch("sovagrid_hub.backup_broker._reap_streams"), \
+                         mock.patch("sovagrid_hub.backup_broker.os.fork",
+                                    return_value=102):
+                        handle(server, self.broker, stream_children=children,
+                               listener=listener)
+                    self.assertEqual(children[102], (request_id, part))
+                finally:
+                    caller.close()
+                    server.close()
+
+        children = {101: active}
+        with mock.patch("sovagrid_hub.backup_broker.os.waitpid", return_value=(101, 0)):
+            _reap_streams(children)
+        self.assertEqual(children, {})
+
+    def test_duplicate_stream_reply_is_clear_client_conflict(self):
+        path = str(Path(self.temp.name) / "stream-active.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(1)
+
+        def serve():
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(1024)
+                connection.sendall(b'{"ok":false,"error":"HOST_STREAM_ACTIVE"}\n')
+
+        try:
+            worker = threading.Thread(target=serve, daemon=True)
+            worker.start()
+            with self.assertRaises(BackupClientError) as error:
+                HostBackupBrokerClient(path).open_portable_stream(
+                    HOST_REQUEST_ID, "archive")
+            self.assertEqual(error.exception.status, 409)
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+        finally:
+            listener.close()
 
     def test_abandoned_portable_header_closes_broker_and_kills_helper(self):
         path = str(Path(self.temp.name) / "abandoned.sock")

@@ -193,6 +193,8 @@ class BackupBrokerClient:
                 raise BackupClientError(404, "Host backup or operation not found")
             if code == "HOST_STREAM_BUSY":
                 raise BackupClientError(429, "Too many host backup downloads")
+            if code == "HOST_STREAM_ACTIVE":
+                raise BackupClientError(409, "This portable backup download is already active")
             if code in {"HOST_BUSY", "HOST_SOURCE_CHANGED", "HOST_STATE_CHANGED",
                         "HOST_DEGRADED_CONTAINERS", "HOST_ARCHIVE_LIMIT",
                         "HOST_OPERATION_LIMIT", "HOST_RECOVERY_FAILED",
@@ -557,6 +559,8 @@ class HostBackupBrokerClient(BackupBrokerClient):
                 raise BackupClientError(503, "Invalid portable backup stream") from exc
             if isinstance(value, dict) and value == {"ok": False, "error": "HOST_STREAM_BUSY"}:
                 raise BackupClientError(429, "Too many host backup downloads")
+            if isinstance(value, dict) and value == {"ok": False, "error": "HOST_STREAM_ACTIVE"}:
+                raise BackupClientError(409, "This portable backup download is already active")
             if not isinstance(value, dict) or value.get("ok") is not True:
                 raise BackupClientError(503, "Portable backup stream unavailable")
             if (set(value) != {"ok", "protocol", "request_id", "part", "bytes", "sha256"} or
