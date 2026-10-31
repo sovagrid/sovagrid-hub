@@ -875,7 +875,7 @@ class HubHandler(BaseHTTPRequestHandler):
                                 "/api/v1/monitoring/settings",
                                 "/api/v1/monitoring/pressure-settings",
                                 "/api/v1/monitoring/inode-settings", "/api/v1/vpn") or re.fullmatch(
-                                    r"/api/v1/servers/[^/]+/(metrics|maintenance|amnezia/control|services/control|containers/control|containers/alerts|filesystems/alerts)", url.path)
+                                    r"/api/v1/servers/[^/]+/(metrics|vpn|maintenance|amnezia/control|services/control|containers/control|containers/alerts|filesystems/alerts)", url.path)
         if not self._authenticated("viewer" if readable else "admin"):
             return
         if url.path == "/api/v1/session":
@@ -968,6 +968,20 @@ class HubHandler(BaseHTTPRequestHandler):
             return
         if url.path == "/api/v1/vpn":
             self._send(200, {"vpn": read_vpn_status(self.app.vpn_status_path)})
+            return
+        match = re.fullmatch(r"/api/v1/servers/([^/]+)/vpn", url.path)
+        if match:
+            if url.query:
+                self._error(400, "Unexpected VPN inventory query parameters")
+            elif not self.app.store.server_exists(match.group(1)):
+                self._error(404, "Server not found")
+            else:
+                try:
+                    self._send(200, self.app.store.remote_vpn_inventory(
+                        match.group(1), session_token=self._token()))
+                except (AuthenticationError, AuthorizationError):
+                    self._error(403 if self.app.store.session_valid(self._token()) else 401,
+                                "Server access denied")
             return
         match = re.fullmatch(r"/api/v1/servers/([^/]+)/amnezia/control", url.path)
         if match:
@@ -1465,6 +1479,30 @@ class HubHandler(BaseHTTPRequestHandler):
                     self._error(401, "Unauthorized")
                 else:
                     self._send(200, {"token": result[0], **info})
+            return
+        match = re.fullmatch(r"/api/v1/servers/([^/]+)/vpn", path)
+        if match:
+            server_id = match.group(1)
+            if urlsplit(self.path).query:
+                self._error(400, "Unexpected VPN inventory query parameters")
+                return
+            if not self.app.store.agent_valid(server_id, self._token()):
+                self._error(401, "Unauthorized")
+                return
+            self._body_auth = ("agent", server_id)
+            data = self._body(max_size=65536, reject_duplicate_keys=True)
+            if data is None:
+                return
+            try:
+                received_at = self.app.store.put_vpn_inventory(
+                    server_id, data, agent_token=self._token())
+            except ValueError as exc:
+                self._error(422, str(exc))
+                return
+            except AuthenticationError:
+                self._error(401, "Unauthorized")
+                return
+            self._send(202, {"accepted": True, "received_at": received_at})
             return
         match = re.fullmatch(r"/api/v1/servers/([^/]+)/metrics", path)
         if match:

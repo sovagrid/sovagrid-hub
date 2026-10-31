@@ -25,6 +25,7 @@ from .enrollment import EnrollmentStore, migrate_enrollments
 from .agent_management import AgentManagementStore, migrate_agent_management
 from .agent_maintenance import AgentMaintenanceStore, migrate_agent_maintenance
 from .server_acl import ServerACLStore, migrate_server_acl
+from .vpn_status import empty_vpn_status, project_vpn_status
 from .vpn_actions import HELPER as VPN_MARKER, is_vpn_command
 from .amnezia_actions import (HELPER as AMNEZIA_MARKER, control_status,
                               is_amnezia_command, status_command)
@@ -1184,6 +1185,11 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             migrate_agent_management(db)
             migrate_agent_maintenance(db)
             migrate_server_acl(db)
+            db.execute("""CREATE TABLE IF NOT EXISTS vpn_inventory (
+                server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+                received_at INTEGER NOT NULL,
+                projection_json TEXT NOT NULL
+            )""")
             migrate_container_alerts(db)
             migrate_filesystem_alerts(db)
             now = int(time.time())
@@ -1343,6 +1349,11 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             migrate_agent_management(db)
             migrate_agent_maintenance(db)
             migrate_server_acl(db)
+            db.execute("""CREATE TABLE IF NOT EXISTS vpn_inventory (
+                server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+                received_at INTEGER NOT NULL,
+                projection_json TEXT NOT NULL
+            )""")
             migrate_container_alerts(db)
             migrate_filesystem_alerts(db)
 
@@ -1536,6 +1547,58 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
         with self.connection() as db:
             row = db.execute("SELECT agent_token_hash FROM servers WHERE id=?", (server_id,)).fetchone()
         return row is not None and hmac.compare_digest(row["agent_token_hash"], hashlib.sha256(token.encode()).hexdigest())
+
+    def put_vpn_inventory(self, server_id: str, snapshot: object, *, agent_token: str,
+                          now: int | None = None) -> int:
+        """Persist only the public projector output, never Agent-supplied JSON."""
+        if (type(snapshot) is not dict or type(snapshot.get("schema_version")) is not int or
+                snapshot["schema_version"] != 1 or type(snapshot.get("collected_at")) is not int or
+                snapshot["collected_at"] < 0 or snapshot.get("source") != "docker_cli" or
+                snapshot.get("source_status") not in ("ok", "error") or
+                type(snapshot.get("services")) is not list):
+            raise ValueError("Invalid VPN inventory")
+        try:
+            payload_size = len(json.dumps(snapshot, ensure_ascii=False, allow_nan=False,
+                                          separators=(",", ":")).encode("utf-8"))
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+            raise ValueError("Invalid VPN inventory") from exc
+        if payload_size > 65536:
+            raise ValueError("Oversized VPN inventory")
+        # Agent freshness was checked on its own host. Hub must use receipt
+        # time, because clocks in different countries can differ or drift.
+        projection = project_vpn_status(snapshot, now=snapshot["collected_at"])
+        serialized = json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
+        if len(serialized.encode("utf-8")) > 65536:
+            raise ValueError("Oversized projected VPN inventory")
+        received_at = int(time.time()) if now is None else now
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._check_agent(db, server_id, agent_token)
+            db.execute("""INSERT INTO vpn_inventory(server_id,received_at,projection_json)
+                          VALUES(?,?,?) ON CONFLICT(server_id) DO UPDATE SET
+                          received_at=excluded.received_at,projection_json=excluded.projection_json""",
+                       (server_id, received_at, serialized))
+        return received_at
+
+    def remote_vpn_inventory(self, server_id: str, *, session_token: str,
+                             now: int | None = None) -> dict:
+        now = int(time.time()) if now is None else now
+        with self.connection() as db:
+            self._require_server_session(db, session_token, server_id, "viewer")
+            row = db.execute("SELECT received_at,projection_json FROM vpn_inventory WHERE server_id=?",
+                             (server_id,)).fetchone()
+        if row is None:
+            return {"server_id": server_id, "received_at": None,
+                    "freshness": "unavailable", "vpn": empty_vpn_status()}
+        projection = json.loads(row["projection_json"])
+        received_at = row["received_at"]
+        fresh = 0 <= now - received_at <= 90
+        if not fresh:
+            for source in (projection, projection["managed"], projection["amnezia_details"]):
+                if source["source_status"] == "ok":
+                    source["source_status"] = "stale"
+        return {"server_id": server_id, "received_at": received_at,
+                "freshness": "ok" if fresh else "stale", "vpn": projection}
 
     @staticmethod
     def _metric_from_row(row):

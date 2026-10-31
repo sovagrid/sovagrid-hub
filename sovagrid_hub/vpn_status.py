@@ -127,25 +127,18 @@ def _managed(snapshot: dict, timestamp: int, now: int) -> dict:
         return {"source_status": "error", "instances": []}
 
 
-def read_vpn_status(path: str | Path, now: int | None = None) -> dict:
-    """Return a fixed public schema; failure in one source leaves the other."""
+def empty_vpn_status(source_status: str = "unavailable") -> dict:
+    return {"schema_version": 1, "collected_at": None, "source_status": source_status,
+            "services": [], "managed": {"source_status": source_status, "instances": []},
+            "amnezia_details": {"schema_version": 1, "source_status": source_status,
+                                "services": []}}
+
+
+def project_vpn_status(snapshot: object, now: int | None = None) -> dict:
+    """Strip every unknown field from a root or Agent-provided VPN snapshot."""
     now = int(time.time()) if now is None else now
-    empty = {"schema_version": 1, "collected_at": None, "source_status": "unavailable",
-             "services": [], "managed": {"source_status": "unavailable", "instances": []},
-             "amnezia_details": {"schema_version": 1, "source_status": "unavailable", "services": []}}
     try:
-        with open(path, "rb") as stream:
-            raw = stream.read(65537)
-    except FileNotFoundError:
-        return empty
-    except OSError:
-        return empty | {"source_status": "error", "managed": {"source_status": "error", "instances": []},
-                        "amnezia_details": {"schema_version": 1, "source_status": "error", "services": []}}
-    try:
-        if len(raw) > 65536:
-            raise ValueError("Oversized snapshot")
-        snapshot = json.loads(raw)
-        if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
+        if type(snapshot) is not dict or snapshot.get("schema_version") != 1:
             raise ValueError("Invalid snapshot header")
         timestamp = snapshot.get("collected_at")
         if isinstance(timestamp, bool) or not isinstance(timestamp, int):
@@ -156,5 +149,22 @@ def read_vpn_status(path: str | Path, now: int | None = None) -> dict:
                 "managed": _managed(snapshot, timestamp, now),
                 "amnezia_details": project_amnezia_details(snapshot, timestamp, now)}
     except (ValueError, TypeError, KeyError):
-        return empty | {"source_status": "error", "managed": {"source_status": "error", "instances": []},
-                        "amnezia_details": {"schema_version": 1, "source_status": "error", "services": []}}
+        return empty_vpn_status("error")
+
+
+def read_vpn_status(path: str | Path, now: int | None = None) -> dict:
+    """Return a fixed public schema; failure in one source leaves the other."""
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(65537)
+    except FileNotFoundError:
+        return empty_vpn_status()
+    except OSError:
+        return empty_vpn_status("error")
+    try:
+        if len(raw) > 65536:
+            raise ValueError("Oversized snapshot")
+        snapshot = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return empty_vpn_status("error")
+    return project_vpn_status(snapshot, now=now)
