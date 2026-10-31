@@ -48,7 +48,8 @@ HOST_RECEIPT = {
     "images_sha256": "e" * 64,
     "images": {"hub": "sha256:" + "1" * 64, "web": "sha256:" + "2" * 64},
     "container_ids": {"hub": "3" * 64, "web": "4" * 64},
-    "exported_configs": {"hub": "5" * 64, "web": "6" * 64},
+    "exported_configs": {"hub": "sha256:" + "5" * 64,
+                         "web": "sha256:" + "6" * 64},
     "rootfs_sha256": {"hub": "7" * 64, "web": "8" * 64},
     "active_units": [], "unit_hashes": {},
 }
@@ -288,6 +289,20 @@ class BackupBrokerTests(unittest.TestCase):
             _host_portable_operation({**HOST_PORTABLE,
                                       "image_receipt": {**HOST_RECEIPT,
                                                         "host_archive_id": "../bad"}})
+        for invalid_config in ("5" * 64, "SHA256:" + "5" * 64,
+                               "sha256:" + "5" * 63, "sha256:" + "g" * 64):
+            with self.subTest(invalid_config=invalid_config):
+                with self.assertRaises(BackupClientError):
+                    _host_portable_operation({
+                        **HOST_PORTABLE,
+                        "image_receipt": {
+                            **HOST_RECEIPT,
+                            "exported_configs": {
+                                **HOST_RECEIPT["exported_configs"],
+                                "hub": invalid_config,
+                            },
+                        },
+                    })
 
     def test_portable_stream_verifies_digest_before_header_and_stays_bounded(self):
         data = b"portable-host-archive-test\n" * 40

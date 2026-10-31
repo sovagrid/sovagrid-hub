@@ -27,6 +27,7 @@ RESTORE_PHASES = frozenset(("pending", "stopping", "stopped", "planning", "plann
 ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{2,63}\Z")
 HOST_ID = re.compile(r"[0-9a-f]{32}\Z")
 HOST_SHA = re.compile(r"[0-9a-f]{64}\Z")
+HOST_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 HOST_UNIT = re.compile(r"sovagrid-[a-z0-9_.@-]{1,80}\.(?:service|socket|timer)\Z")
 HOST_PHASES = frozenset(("accepted", "stopping", "archiving", "restarting",
                          "complete", "recovery_requested", "recovered", "failed",
@@ -299,12 +300,16 @@ def _host_receipt(value: object, *, archive_id: str | None = None) -> dict:
                 for key in ("host_archive_sha256", "source_manifest_sha256", "images_sha256")) or
             not isinstance(value["images"], dict) or
             set(value["images"]) not in ({"hub", "web"}, {"hub", "web", "ssh-gateway"}) or
-            any(not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None
+            any(not isinstance(image, str) or HOST_IMAGE_ID.fullmatch(image) is None
                 for image in value["images"].values()) or
             any(not isinstance(value[key], dict) or set(value[key]) != set(value["images"]) or
                 any(not isinstance(item, str) or HOST_SHA.fullmatch(item) is None
                     for item in value[key].values())
-                for key in ("container_ids", "exported_configs", "rootfs_sha256")) or
+                for key in ("container_ids", "rootfs_sha256")) or
+            not isinstance(value["exported_configs"], dict) or
+            set(value["exported_configs"]) != set(value["images"]) or
+            any(not isinstance(item, str) or HOST_IMAGE_ID.fullmatch(item) is None
+                for item in value["exported_configs"].values()) or
             not isinstance(value["active_units"], list) or len(value["active_units"]) > 32 or
             any(not isinstance(unit, str) or HOST_UNIT.fullmatch(unit) is None
                 for unit in value["active_units"]) or
