@@ -380,6 +380,12 @@ class HubHandler(BaseHTTPRequestHandler):
             self._error(401, "Download grant expired or already used")
             return
         try:
+            status = self.app.host_backups.portable_status(request_id)
+            if (status["phase"] != "complete" or status["archive"] is None or
+                    status["image_receipt"] is None):
+                self._error(409, "Portable backup is not complete")
+                return
+            archive_id = status["archive"]["id"]
             self.app.store.audit_host_backup_download(
                 request_id, part, "started", session_token=token)
             stream = self.app.host_backups.open_portable_stream(
@@ -390,7 +396,9 @@ class HubHandler(BaseHTTPRequestHandler):
                 return
             self._error(exc.status, str(exc))
             return
-        filenames = {"archive": "host.tar.gz", "images": "images.tar",
+        filenames = {"archive": archive_id + ".tar.gz",
+                     "host_manifest": archive_id + ".manifest.json",
+                     "images": "images.tar", "images_manifest": "manifest.json",
                      "receipt": "receipt.json"}
         with stream:
             try:
@@ -403,8 +411,8 @@ class HubHandler(BaseHTTPRequestHandler):
                 self.connection.settimeout(45)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Disposition", "attachment; filename=\"sovagrid-" +
-                                 request_id + "-" + filenames[part] + "\"")
+                self.send_header("Content-Disposition", "attachment; filename=\"" +
+                                 filenames[part] + "\"")
                 self.send_header("Content-Length", str(stream.size))
                 self.send_header("X-SovaGrid-SHA256", stream.sha256)
                 self.send_header("Cache-Control", "no-store")
@@ -857,7 +865,7 @@ class HubHandler(BaseHTTPRequestHandler):
             return
         host_base = "/api/v1/host-backups"
         host_portable_download = re.fullmatch(
-            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable/download/(archive|images|receipt)",
+            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable/download/(archive|host_manifest|images|images_manifest|receipt)",
             url.path)
         if host_portable_download:
             self._serve_host_portable_download(host_portable_download.group(1),
@@ -1619,7 +1627,7 @@ class HubHandler(BaseHTTPRequestHandler):
         host_base = "/api/v1/host-backups"
         host_portable_start = path == host_base + "/portable/operations"
         host_download_grant = re.fullmatch(
-            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable/download-grants/(archive|images|receipt)",
+            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable/download-grants/(archive|host_manifest|images|images_manifest|receipt)",
             path)
         if host_download_grant:
             if not self._admin() or not self._public_web_origin_ok():

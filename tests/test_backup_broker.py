@@ -259,6 +259,10 @@ class BackupBrokerTests(unittest.TestCase):
             {"action": "host_portable_verify", "request_id": HOST_REQUEST_ID},
             {"action": "host_portable_stream", "request_id": HOST_REQUEST_ID,
              "part": "images"},
+            {"action": "host_portable_stream", "request_id": HOST_REQUEST_ID,
+             "part": "host_manifest"},
+            {"action": "host_portable_stream", "request_id": HOST_REQUEST_ID,
+             "part": "images_manifest"},
         )
         for payload in accepted:
             self.assertEqual(_request((json.dumps(payload) + "\n").encode()), payload)
@@ -390,6 +394,77 @@ class BackupBrokerTests(unittest.TestCase):
                 self.assertFalse(worker.is_alive())
         finally:
             listener.close()
+
+    def test_portable_metadata_streams_verified_source_files_only(self):
+        host_manifest = {
+            "protocol": "sovagrid-host-backup-v1", **HOST_ARCHIVE,
+            "sha256": HOST_RECEIPT["host_archive_sha256"],
+            "source_manifest_sha256": HOST_MANIFEST,
+        }
+        images_manifest = {
+            "protocol": "sovagrid-host-images-v1", "id": HOST_ARCHIVE_ID,
+            "host_archive_sha256": HOST_RECEIPT["host_archive_sha256"],
+            "source_manifest_sha256": HOST_MANIFEST,
+            "layout": "full", "created_at": HOST_ARCHIVE["created_at"],
+            "bytes": 2048, "sha256": HOST_RECEIPT["images_sha256"],
+            "files": 5, "images": HOST_RECEIPT["images"],
+            "container_ids": HOST_RECEIPT["container_ids"],
+            "exported_configs": HOST_RECEIPT["exported_configs"],
+            "rootfs_sha256": HOST_RECEIPT["rootfs_sha256"],
+        }
+        checked = {"ok": True, "request_id": HOST_REQUEST_ID,
+                   "archive": HOST_ARCHIVE, "images_bytes": 2048,
+                   "receipt": HOST_RECEIPT}
+        for part, manifest in (("host_manifest", host_manifest),
+                               ("images_manifest", images_manifest)):
+            for mode in ("valid", "corrupt", "changed_during_verify"):
+                with self.subTest(part=part, mode=mode):
+                    selected = dict(manifest)
+                    if mode == "corrupt":
+                        selected["source_manifest_sha256"] = "0" * 64
+                    data = json.dumps(selected, separators=(",", ":")).encode()
+                    root = Path(self.temp.name)
+                    path = (root / (HOST_ARCHIVE_ID + ".manifest.json")
+                            if part == "host_manifest" else
+                            root / HOST_ARCHIVE_ID / "manifest.json")
+                    path.parent.mkdir(exist_ok=True)
+                    path.write_bytes(data)
+                    caller, server = socket.socketpair()
+                    try:
+                        def opened(*_args, **_kwargs):
+                            fd = os.open(path, os.O_RDONLY)
+                            return fd, os.fstat(fd)
+                        def verified(*_args, **_kwargs):
+                            if mode == "changed_during_verify":
+                                path.write_bytes(data.replace(b'"files":5', b'"files":6'))
+                            return checked
+                        with mock.patch("sovagrid_hub.backup_broker._host_command",
+                                        return_value=HOST_PORTABLE), \
+                             mock.patch("sovagrid_hub.backup_broker._host_verify_portable",
+                                        side_effect=verified), \
+                             mock.patch("sovagrid_hub.backup_broker._stream_open",
+                                        side_effect=opened), \
+                             mock.patch("sovagrid_hub.backup_broker.HOST_ARCHIVES", root), \
+                             mock.patch("sovagrid_hub.backup_broker.HOST_IMAGES", root):
+                            worker = threading.Thread(target=_stream_send,
+                                args=(server, {"request_id": HOST_REQUEST_ID,
+                                               "part": part}), daemon=True)
+                            worker.start()
+                            with caller.makefile("rb") as reader:
+                                header = json.loads(reader.readline(1025))
+                                if mode != "valid":
+                                    self.assertEqual(header, {"ok": False,
+                                                              "error": "HOST_UNAVAILABLE"})
+                                else:
+                                    self.assertEqual(header["bytes"], len(data))
+                                    self.assertEqual(header["sha256"],
+                                                     hashlib.sha256(data).hexdigest())
+                                    self.assertEqual(reader.read(len(data)), data)
+                            worker.join(3)
+                            self.assertFalse(worker.is_alive())
+                    finally:
+                        caller.close()
+                        server.close()
 
     def test_stream_capacity_does_not_block_control_request(self):
         children = {101: None, 102: None}
@@ -938,6 +1013,67 @@ class BackupApiTests(unittest.TestCase):
                             item["subject_id"] == HOST_REQUEST_ID for item in events))
         self.assertTrue(any(item["action"] == "host_backup_download_started" and
                             item["subject_id"] == HOST_REQUEST_ID for item in events))
+
+    def test_portable_metadata_grants_use_archive_filename_and_remain_one_use(self):
+        class Stream:
+            size = 7
+            sha256 = hashlib.sha256(b"payload").hexdigest()
+            remaining = 0
+
+            def __enter__(self):
+                self.reader = io.BytesIO(b"payload")
+                return self
+
+            def __exit__(self, *_args):
+                self.reader.close()
+
+            def read(self):
+                return self.reader.read(7)
+
+        self.host_backup.open_portable_stream.return_value = Stream()
+        for part, filename in (("archive", HOST_ARCHIVE_ID + ".tar.gz"),
+                               ("host_manifest", HOST_ARCHIVE_ID + ".manifest.json"),
+                               ("images", "images.tar"),
+                               ("images_manifest", "manifest.json"),
+                               ("receipt", "receipt.json")):
+            with self.subTest(part=part):
+                route = ("/api/v1/host-backups/operations/" + HOST_REQUEST_ID +
+                         "/portable/download-grants/" + part)
+                request = urllib.request.Request(
+                    self.base + route, data=b"{}", method="POST",
+                    headers={"Authorization": "Bearer " + self.admin,
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(request) as response:
+                    cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                    response.read()
+                download = route.replace("download-grants", "download")
+                if part == "host_manifest":
+                    other_archive = download.replace(HOST_REQUEST_ID, HOST_ARCHIVE_ID)
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(urllib.request.Request(
+                            self.base + other_archive, headers={"Cookie": cookie}))
+                    self.assertEqual(error.exception.code, 401)
+                    error.exception.close()
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(urllib.request.Request(
+                            self.base + download, headers={"Cookie": cookie}))
+                    self.assertEqual(error.exception.code, 401)
+                    error.exception.close()
+                    with urllib.request.urlopen(request) as response:
+                        cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                        response.read()
+                with urllib.request.urlopen(urllib.request.Request(
+                        self.base + download, headers={"Cookie": cookie})) as response:
+                    self.assertEqual(response.headers["Content-Disposition"],
+                                     'attachment; filename="' + filename + '"')
+                    self.assertEqual(response.read(), b"payload")
+                self.host_backup.open_portable_stream.assert_called_with(
+                    HOST_REQUEST_ID, part, cancel_socket=mock.ANY)
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(urllib.request.Request(
+                        self.base + download, headers={"Cookie": cookie}))
+                self.assertEqual(error.exception.code, 401)
+                error.exception.close()
 
     def test_portable_download_grant_dies_with_session(self):
         route = ("/api/v1/host-backups/operations/" + HOST_REQUEST_ID +

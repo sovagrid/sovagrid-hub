@@ -1444,7 +1444,8 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
                                    *, session_token: str) -> None:
         if (not isinstance(request_id, str) or
                 re.fullmatch(r"[0-9a-f]{32}", request_id) is None or
-                part not in ("archive", "images", "receipt") or
+                part not in ("archive", "host_manifest", "images", "images_manifest",
+                             "receipt") or
                 stage not in ("granted", "started", "completed")):
             raise ValueError("Invalid host backup download")
         with self.connection() as db:

@@ -61,6 +61,8 @@ HOST_PROTOCOL = "sovagrid-host-backup-v1"
 HOST_OPERATION_PROTOCOL = "sovagrid-host-backup-operation-v1"
 HOST_IMAGE_PROTOCOL = "sovagrid-host-images-v1"
 HOST_DOWNLOAD_PROTOCOL = "sovagrid-host-download-v1"
+HOST_PORTABLE_PARTS = frozenset(("archive", "host_manifest", "images",
+                                "images_manifest", "receipt"))
 MAX_STREAM_CHILDREN = 2
 MAX_STREAM_SECONDS = 5_400
 MAX_STREAM_BYTES = 8 * 1024**3
@@ -123,7 +125,7 @@ def _request(raw: bytes) -> dict:
     if (action == "host_portable_stream" and
             set(value) == {"action", "request_id", "part"} and
             isinstance(value["request_id"], str) and HOST_ID.fullmatch(value["request_id"]) and
-            value["part"] in ("archive", "images", "receipt")):
+            isinstance(value["part"], str) and value["part"] in HOST_PORTABLE_PARTS):
         return value
     if action in ("host_start", "host_portable_start") and set(value) == {
             "action", "request_id", "expected_manifest_sha256"} and isinstance(
@@ -353,6 +355,11 @@ def _stream_open(path: Path, *, parent: Path, size: int | None) -> tuple[int, os
     return fd, info
 
 
+def _stream_fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns)
+
+
 def _stream_send(connection: socket.socket, payload: dict) -> None:
     """Stream one independently verified portable artifact with bounded memory."""
     sent_header = False
@@ -361,6 +368,30 @@ def _stream_send(connection: socket.socket, payload: dict) -> None:
         request_id, part = payload["request_id"], payload["part"]
         status = _host_command(HOST_OPERATION_SCRIPT, "portable-status", request_id,
                                cancel_connection=connection)
+        metadata_limits = {"host_manifest": 2048, "images_manifest": 4096,
+                           "receipt": 8192}
+        pinned_path = None
+        pinned_archive_id = None
+        if part in metadata_limits:
+            # Pin the metadata descriptor before the fixed source verifier
+            # opens its own copy. A post-verification stat then proves the
+            # exact file we stream is the one still at the verified path.
+            initial_archive = status.get("archive")
+            if (not isinstance(initial_archive, dict) or
+                    not isinstance(initial_archive.get("id"), str) or
+                    HOST_ID.fullmatch(initial_archive["id"]) is None):
+                raise BackupError("HOST_UNAVAILABLE")
+            pinned_archive_id = initial_archive["id"]
+            if part == "host_manifest":
+                parent = HOST_ARCHIVES
+                pinned_path = parent / (pinned_archive_id + ".manifest.json")
+            else:
+                parent = HOST_IMAGES / pinned_archive_id
+                pinned_path = parent / ("manifest.json" if part == "images_manifest"
+                                        else "receipt.json")
+            fd, before = _stream_open(pinned_path, parent=parent, size=None)
+            if before.st_size > metadata_limits[part]:
+                raise BackupError("HOST_UNAVAILABLE")
         checked = _host_verify_portable(status, request_id,
                                         cancel_connection=connection)
         archive_id = checked["archive"]["id"]
@@ -370,23 +401,36 @@ def _stream_send(connection: socket.socket, payload: dict) -> None:
             parent = HOST_ARCHIVES
             size = checked["archive"]["bytes"]
             expected = receipt.get("host_archive_sha256")
+        elif part == "host_manifest":
+            path = HOST_ARCHIVES / (archive_id + ".manifest.json")
+            parent = HOST_ARCHIVES
+            size = None
+            expected = None
         elif part == "images":
             parent = HOST_IMAGES / archive_id
             path = parent / "images.tar"
             size = checked["images_bytes"]
             expected = receipt.get("images_sha256")
+        elif part == "images_manifest":
+            parent = HOST_IMAGES / archive_id
+            path = parent / "manifest.json"
+            size = None
+            expected = None
         else:
             parent = HOST_IMAGES / archive_id
             path = parent / "receipt.json"
             size = None
             expected = None
-        if part != "receipt" and (not isinstance(expected, str) or
-                                  HOST_SHA.fullmatch(expected) is None):
+        if part in ("archive", "images") and (not isinstance(expected, str) or
+                                               HOST_SHA.fullmatch(expected) is None):
             raise BackupError("HOST_UNAVAILABLE")
-        fd, before = _stream_open(path, parent=parent, size=size)
-        if part == "receipt":
-            if before.st_size > 8192:
-                raise BackupError("HOST_UNAVAILABLE")
+        if fd is None:
+            fd, before = _stream_open(path, parent=parent, size=size)
+        elif (pinned_archive_id != archive_id or pinned_path != path or
+              _stream_fingerprint(path.lstat()) != _stream_fingerprint(before) or
+              _stream_fingerprint(os.fstat(fd)) != _stream_fingerprint(before)):
+            raise BackupError("HOST_UNAVAILABLE")
+        if part in metadata_limits:
             raw = bytearray()
             while len(raw) < before.st_size:
                 block = os.read(fd, before.st_size - len(raw))
@@ -397,7 +441,33 @@ def _stream_send(connection: socket.socket, payload: dict) -> None:
                 parsed = json.loads(raw, object_pairs_hook=_unique)
             except (UnicodeError, ValueError) as exc:
                 raise BackupError("HOST_UNAVAILABLE") from exc
-            if parsed != receipt:
+            host_fields = {"protocol", "id", "created_at", "layout", "bytes",
+                           "files", "sha256", "source_manifest_sha256"}
+            image_fields = {"protocol", "id", "host_archive_sha256",
+                            "source_manifest_sha256", "layout", "created_at",
+                            "bytes", "sha256", "files", "images",
+                            "container_ids", "exported_configs", "rootfs_sha256"}
+            if part == "receipt" and parsed != receipt:
+                raise BackupError("HOST_UNAVAILABLE")
+            if part == "host_manifest" and (
+                    not isinstance(parsed, dict) or set(parsed) != host_fields or
+                    parsed["protocol"] != HOST_PROTOCOL or parsed["id"] != archive_id or
+                    type(parsed["bytes"]) is not int or type(parsed["files"]) is not int or
+                    any(parsed[key] != checked["archive"].get(key)
+                        for key in ("created_at", "layout", "bytes", "files")) or
+                    parsed["sha256"] != receipt.get("host_archive_sha256") or
+                    parsed["source_manifest_sha256"] != receipt.get("source_manifest_sha256")):
+                raise BackupError("HOST_UNAVAILABLE")
+            if part == "images_manifest" and (
+                    not isinstance(parsed, dict) or set(parsed) != image_fields or
+                    parsed["protocol"] != HOST_IMAGE_PROTOCOL or parsed["id"] != archive_id or
+                    parsed["layout"] != checked["archive"].get("layout") or
+                    type(parsed["bytes"]) is not int or type(parsed["files"]) is not int or
+                    parsed["bytes"] != checked["images_bytes"] or
+                    any(parsed[key] != receipt.get(key) for key in (
+                        "host_archive_sha256", "source_manifest_sha256", "images",
+                        "container_ids", "exported_configs", "rootfs_sha256")) or
+                    parsed["sha256"] != receipt.get("images_sha256")):
                 raise BackupError("HOST_UNAVAILABLE")
             expected = hashlib.sha256(raw).hexdigest()
             os.lseek(fd, 0, os.SEEK_SET)
@@ -418,10 +488,7 @@ def _stream_send(connection: socket.socket, payload: dict) -> None:
             counted += len(block)
         current = os.fstat(fd)
         if (preflight.hexdigest() != expected or
-                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
-                 before.st_ctime_ns) !=
-                (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns,
-                 current.st_ctime_ns)):
+                _stream_fingerprint(before) != _stream_fingerprint(current)):
             raise BackupError("HOST_UNAVAILABLE")
         os.lseek(fd, 0, os.SEEK_SET)
         header = {"ok": True, "protocol": HOST_DOWNLOAD_PROTOCOL,
@@ -441,10 +508,7 @@ def _stream_send(connection: socket.socket, payload: dict) -> None:
             count += len(block)
         after = os.fstat(fd)
         if (digest.hexdigest() != expected or
-                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
-                 before.st_ctime_ns) !=
-                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
-                 after.st_ctime_ns)):
+                _stream_fingerprint(before) != _stream_fingerprint(after)):
             raise BackupError("HOST_UNAVAILABLE")
     except (BackupError, OSError, ValueError, TypeError):
         if not sent_header:

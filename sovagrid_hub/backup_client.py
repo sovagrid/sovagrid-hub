@@ -38,7 +38,8 @@ HOST_PROTOCOL = "sovagrid-host-backup-operation-v1"
 HOST_MAX_BYTES = 8 * 1024**3
 HOST_COMPOSE_SERVICES = frozenset(("hub", "web", "ssh-gateway"))
 HOST_PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v1"
-HOST_PARTS = frozenset(("archive", "images", "receipt"))
+HOST_PARTS = frozenset(("archive", "host_manifest", "images", "images_manifest",
+                       "receipt"))
 
 
 class BackupClientError(RuntimeError):
@@ -570,7 +571,9 @@ class HostBackupBrokerClient(BackupBrokerClient):
                     not 0 < value["bytes"] <= HOST_MAX_BYTES or
                     not isinstance(value["sha256"], str) or
                     HOST_SHA.fullmatch(value["sha256"]) is None or
-                    (part == "receipt" and value["bytes"] > 8192)):
+                    (part == "receipt" and value["bytes"] > 8192) or
+                    (part == "host_manifest" and value["bytes"] > 2048) or
+                    (part == "images_manifest" and value["bytes"] > 4096)):
                 raise BackupClientError(503, "Invalid portable backup stream")
             connection.settimeout(45)
             result = HostPortableStream(connection, reader, value["bytes"], value["sha256"])
