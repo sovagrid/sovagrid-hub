@@ -105,7 +105,8 @@ class BackupBrokerClient:
         self.socket_path = socket_path
 
     def _request(self, payload: dict, *, restore_record: bool = False,
-                 timeout_seconds: int = 930) -> dict:
+                 timeout_seconds: int = 930,
+                 cancel_socket: socket.socket | None = None) -> dict:
         raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -114,7 +115,26 @@ class BackupBrokerClient:
                 connection.settimeout(timeout_seconds)
                 connection.sendall(raw)
                 response = bytearray()
+                deadline = time.monotonic() + timeout_seconds
+                watched_peer = cancel_socket
                 while len(response) <= MAX_RESPONSE:
+                    if watched_peer is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise BackupClientError(503, "Backup broker timed out")
+                        ready, _, _ = select.select(
+                            [connection, watched_peer], [], [], min(1, remaining))
+                        if watched_peer in ready:
+                            try:
+                                pending = watched_peer.recv(1, socket.MSG_PEEK)
+                            except OSError:
+                                pending = b""
+                            if not pending:
+                                raise BackupClientError(499, "Request client disconnected")
+                            # Keep pipelined HTTP bytes for its own handler.
+                            watched_peer = None
+                        if connection not in ready:
+                            continue
                     chunk = connection.recv(min(4096, MAX_RESPONSE + 1 - len(response)))
                     if not chunk:
                         break
@@ -462,11 +482,12 @@ class HostBackupBrokerClient(BackupBrokerClient):
                                                       "request_id": request_id},
                                                      timeout_seconds=90), identity=request_id)
 
-    def verify_portable(self, request_id: str) -> dict:
+    def verify_portable(self, request_id: str, *,
+                        cancel_socket: socket.socket | None = None) -> dict:
         if not _host_id(request_id):
             raise BackupClientError(400, "Invalid portable backup request ID")
         value = self._request({"action": "host_portable_verify", "request_id": request_id},
-                              timeout_seconds=2_300)
+                              timeout_seconds=2_300, cancel_socket=cancel_socket)
         archive = value.get("archive")
         receipt = value.get("receipt")
         if (set(value) != {"ok", "request_id", "archive", "images_bytes", "receipt"} or

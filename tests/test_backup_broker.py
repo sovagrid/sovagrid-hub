@@ -477,6 +477,65 @@ class BackupBrokerTests(unittest.TestCase):
             caller.close()
             broker.close()
 
+    def test_abandoned_portable_verify_closes_broker_and_cancels_helpers(self):
+        caller, broker = socket.socketpair()
+        try:
+            payload = {"action": "host_portable_verify", "request_id": HOST_REQUEST_ID}
+            with mock.patch("sovagrid_hub.backup_broker._host_command",
+                            return_value=HOST_PORTABLE) as command, \
+                 mock.patch("sovagrid_hub.backup_broker._host_verify_portable",
+                            return_value={"ok": True}) as verify:
+                self.assertEqual(_host_execute(payload, cancel_connection=broker),
+                                 {"ok": True})
+            self.assertIs(command.call_args.kwargs["cancel_connection"], broker)
+            self.assertIs(verify.call_args.kwargs["cancel_connection"], broker)
+        finally:
+            caller.close()
+            broker.close()
+
+        path = str(Path(self.temp.name) / "verify-abandoned.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(1)
+        ready = threading.Event()
+        ended = []
+
+        def serve():
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(4)
+                connection.recv(1024)
+                ready.set()
+                ended.append(connection.recv(1))
+
+        browser, browser_peer = socket.socketpair()
+        try:
+            server = threading.Thread(target=serve, daemon=True)
+            server.start()
+            errors = []
+
+            def verify_request():
+                try:
+                    HostBackupBrokerClient(path).verify_portable(
+                        HOST_REQUEST_ID, cancel_socket=browser)
+                except BackupClientError as exc:
+                    errors.append(exc.status)
+
+            client = threading.Thread(target=verify_request, daemon=True)
+            client.start()
+            self.assertTrue(ready.wait(2))
+            browser_peer.close()
+            client.join(3)
+            server.join(3)
+            self.assertFalse(client.is_alive())
+            self.assertFalse(server.is_alive())
+            self.assertEqual(errors, [499])
+            self.assertEqual(ended, [b""])
+        finally:
+            browser.close()
+            browser_peer.close()
+            listener.close()
+
     def test_web_restore_space_guard_precedes_any_docker_stop(self):
         target = self.manager.create()["id"]
         fake = mock.Mock(spec=RestoreOrchestrator)
@@ -720,6 +779,11 @@ class BackupApiTests(unittest.TestCase):
         self.assertEqual(self.request("GET", portable, token=self.admin), (200, HOST_PORTABLE))
         self.assertEqual(self.request("GET", portable + "/verify", token=self.admin),
                          (200, self.host_backup.verify_portable.return_value))
+        self.assertEqual(self.host_backup.verify_portable.call_args.args,
+                         (HOST_REQUEST_ID,))
+        self.assertIsInstance(
+            self.host_backup.verify_portable.call_args.kwargs["cancel_socket"],
+            socket.socket)
         selected = self.store.create_user("portable-selected", PASSWORD, "admin")
         selected_token = self.request("POST", "/api/v1/session",
                                       {"username": "portable-selected", "password": PASSWORD})[1]["token"]

@@ -244,7 +244,8 @@ def _host_command(script: Path, *arguments: str, timeout: int = 120,
     return value
 
 
-def _host_execute(payload: dict) -> dict:
+def _host_execute(payload: dict, *,
+                  cancel_connection: socket.socket | None = None) -> dict:
     action = payload["action"]
     if action == "host_portable_capabilities":
         supported = True
@@ -267,10 +268,14 @@ def _host_execute(payload: dict) -> dict:
                 break
         return {"ok": True, "supported": supported, "download": supported}
     if action in ("host_portable_status", "host_portable_verify"):
-        status = _host_command(HOST_OPERATION_SCRIPT, "portable-status", payload["request_id"])
+        command_options = ({"cancel_connection": cancel_connection}
+                           if action == "host_portable_verify" else {})
+        status = _host_command(HOST_OPERATION_SCRIPT, "portable-status",
+                               payload["request_id"], **command_options)
         if action == "host_portable_status":
             return status
-        return _host_verify_portable(status, payload["request_id"])
+        return _host_verify_portable(status, payload["request_id"],
+                                     cancel_connection=cancel_connection)
     if action == "host_plan":
         source = _host_command(HOST_SCRIPT, "source", timeout=90)
         if (set(source) != {"ok", "protocol", "manifest_sha256"} or
@@ -810,7 +815,8 @@ def handle(connection: socket.socket, broker: BackupBroker, *,
                 if payload["action"] == "host_portable_stream":
                     _stream_send(connection, payload)
                 else:
-                    connection.sendall(_response(broker.execute(payload)))
+                    connection.sendall(_response(_host_execute(
+                        payload, cancel_connection=connection)))
                 return
             _reap_streams(stream_children)
             if len(stream_children) >= MAX_STREAM_CHILDREN or listener is None:
@@ -829,7 +835,7 @@ def handle(connection: socket.socket, broker: BackupBroker, *,
                     _stream_send(connection, payload)
                 else:
                     try:
-                        answer = broker.execute(payload)
+                        answer = _host_execute(payload, cancel_connection=connection)
                     except BackupError as exc:
                         answer = {"ok": False, "error": str(exc)}
                     except (OSError, ValueError, TypeError):

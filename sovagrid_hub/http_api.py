@@ -891,7 +891,8 @@ class HubHandler(BaseHTTPRequestHandler):
                 elif host_portable_status:
                     result = self.app.host_backups.portable_status(host_portable_status.group(1))
                 elif host_portable_verify:
-                    result = self.app.host_backups.verify_portable(host_portable_verify.group(1))
+                    result = self.app.host_backups.verify_portable(
+                        host_portable_verify.group(1), cancel_socket=self.connection)
                 else:
                     result = self.app.host_backups.operation_status(host_status.group(1))
                 if not self.app.store.unrestricted_admin(self._token()):
@@ -899,6 +900,9 @@ class HubHandler(BaseHTTPRequestHandler):
                     return
                 self._send(200, result)
             except BackupClientError as exc:
+                if exc.status == 499:
+                    self.close_connection = True
+                    return
                 self._error(exc.status, str(exc))
             return
         restore_status = re.fullmatch(r"/api/v1/backups/restores/([^/]+)", url.path)
