@@ -1424,18 +1424,34 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
                                 subject_id=request_key)
 
     def audit_host_backup_request(self, request_id: str, *, recover: bool,
+                                  portable: bool = False,
                                   session_token: str) -> None:
         if (not isinstance(request_id, str) or
                 re.fullmatch(r"[0-9a-f]{32}", request_id) is None or
-                type(recover) is not bool):
+                type(recover) is not bool or type(portable) is not bool or
+                (recover and portable)):
             raise ValueError("Invalid host backup request")
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             identity = self._require_unrestricted_admin(db, session_token)
             self._audit_account(db, identity,
                                 "host_backup_recovery_requested" if recover
+                                else "host_backup_portable_create_requested" if portable
                                 else "host_backup_create_requested",
                                 subject_id=request_id)
+
+    def audit_host_backup_download(self, request_id: str, part: str, stage: str,
+                                   *, session_token: str) -> None:
+        if (not isinstance(request_id, str) or
+                re.fullmatch(r"[0-9a-f]{32}", request_id) is None or
+                part not in ("archive", "images", "receipt") or
+                stage not in ("granted", "started", "completed")):
+            raise ValueError("Invalid host backup download")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            identity = self._require_unrestricted_admin(db, session_token)
+            self._audit_account(db, identity, "host_backup_download_" + stage,
+                                subject_id=request_id, details={"part": part})
 
     def audit_release_feed_request(self, action: str, expected_state: str, *,
                                    session_token: str) -> None:

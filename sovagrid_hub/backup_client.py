@@ -11,7 +11,8 @@ import socket
 import uuid
 from datetime import datetime, timedelta
 
-from .backup_broker import MAX_RESPONSE, SOCKET_PATH, FEED_SHA, _feed_status_shape
+from .backup_broker import (MAX_RESPONSE, SOCKET_PATH, FEED_SHA, _feed_status_shape,
+                            HOST_DOWNLOAD_PROTOCOL)
 from .external_agent_control import valid_result as valid_external_result, valid_sha as valid_external_sha
 from .external_agent_operations import (canonical_id as external_operation_id,
                                         valid_status as valid_external_operation)
@@ -33,6 +34,8 @@ HOST_PHASES = frozenset(("accepted", "stopping", "archiving", "restarting",
 HOST_PROTOCOL = "sovagrid-host-backup-operation-v1"
 HOST_MAX_BYTES = 8 * 1024**3
 HOST_COMPOSE_SERVICES = frozenset(("hub", "web", "ssh-gateway"))
+HOST_PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v1"
+HOST_PARTS = frozenset(("archive", "images", "receipt"))
 
 
 class BackupClientError(RuntimeError):
@@ -165,11 +168,14 @@ class BackupBrokerClient:
                 raise BackupClientError(404, "Backup not found")
             if code == "HOST_NOT_FOUND":
                 raise BackupClientError(404, "Host backup or operation not found")
+            if code == "HOST_STREAM_BUSY":
+                raise BackupClientError(429, "Too many host backup downloads")
             if code in {"HOST_BUSY", "HOST_SOURCE_CHANGED", "HOST_STATE_CHANGED",
                         "HOST_DEGRADED_CONTAINERS", "HOST_ARCHIVE_LIMIT",
                         "HOST_OPERATION_LIMIT", "HOST_RECOVERY_FAILED",
                         "HOST_RESTART_INCOMPLETE", "HOST_SERVICES_RUNNING",
-                        "HOST_CONTAINERS_RUNNING"}:
+                        "HOST_CONTAINERS_RUNNING", "HOST_STACK_NOT_READY",
+                        "HOST_NOT_READY", "HOST_NOT_PORTABLE"}:
                 raise BackupClientError(409, "Host backup needs administrator attention")
             if code == "RESTORE_NOT_FOUND":
                 raise BackupClientError(404, "Restore request not found")
@@ -281,8 +287,92 @@ def _host_operation(value: object, *, identity: str | None = None) -> dict:
     return value
 
 
+def _host_receipt(value: object, *, archive_id: str | None = None) -> dict:
+    keys = {"protocol", "host_archive_id", "host_archive_sha256",
+            "source_manifest_sha256", "images_sha256", "images", "container_ids",
+            "exported_configs", "rootfs_sha256", "active_units", "unit_hashes"}
+    if (not isinstance(value, dict) or set(value) != keys or
+            value["protocol"] != HOST_PORTABLE_RECEIPT or
+            not _host_id(value["host_archive_id"]) or
+            (archive_id is not None and value["host_archive_id"] != archive_id) or
+            any(not isinstance(value[key], str) or HOST_SHA.fullmatch(value[key]) is None
+                for key in ("host_archive_sha256", "source_manifest_sha256", "images_sha256")) or
+            not isinstance(value["images"], dict) or
+            set(value["images"]) not in ({"hub", "web"}, {"hub", "web", "ssh-gateway"}) or
+            any(not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None
+                for image in value["images"].values()) or
+            any(not isinstance(value[key], dict) or set(value[key]) != set(value["images"]) or
+                any(not isinstance(item, str) or HOST_SHA.fullmatch(item) is None
+                    for item in value[key].values())
+                for key in ("container_ids", "exported_configs", "rootfs_sha256")) or
+            not isinstance(value["active_units"], list) or len(value["active_units"]) > 32 or
+            any(not isinstance(unit, str) or HOST_UNIT.fullmatch(unit) is None
+                for unit in value["active_units"]) or
+            len(set(value["active_units"])) != len(value["active_units"]) or
+            not isinstance(value["unit_hashes"], dict) or
+            set(value["unit_hashes"]) != set(value["active_units"]) or
+            any(not isinstance(digest, str) or HOST_SHA.fullmatch(digest) is None
+                for digest in value["unit_hashes"].values())):
+        raise BackupClientError(503, "Invalid portable backup broker reply")
+    return value
+
+
+def _host_portable_operation(value: object, *, identity: str | None = None) -> dict:
+    if not isinstance(value, dict) or "image_receipt" not in value:
+        raise BackupClientError(503, "Invalid portable backup broker reply")
+    operation = _host_operation({key: item for key, item in value.items()
+                                 if key != "image_receipt"}, identity=identity)
+    receipt = value["image_receipt"]
+    if (operation["phase"] == "complete") != (receipt is not None):
+        raise BackupClientError(503, "Invalid portable backup broker reply")
+    if receipt is not None:
+        _host_receipt(receipt, archive_id=operation["archive"]["id"])
+    return value
+
+
+class HostPortableStream:
+    """One exact artifact body from the root broker, with bounded reads."""
+
+    def __init__(self, connection: socket.socket, reader, size: int, sha256: str):
+        self.connection, self.reader = connection, reader
+        self.size, self.sha256, self.remaining = size, sha256, size
+
+    def read(self, maximum: int = 131072) -> bytes:
+        if self.remaining == 0:
+            return b""
+        try:
+            block = self.reader.read(min(maximum, self.remaining))
+        except (OSError, socket.timeout) as exc:
+            raise BackupClientError(503, "Portable backup stream interrupted") from exc
+        if not block:
+            raise BackupClientError(503, "Portable backup stream truncated")
+        self.remaining -= len(block)
+        return block
+
+    def close(self) -> None:
+        try:
+            self.reader.close()
+        finally:
+            self.connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
 class HostBackupBrokerClient(BackupBrokerClient):
-    """Metadata-only protocol to the already installed root backup socket."""
+    """Restricted host backup metadata and one-artifact stream protocol."""
+
+    def portable_capabilities(self) -> dict:
+        value = self._request({"action": "host_portable_capabilities"}, timeout_seconds=15)
+        if (set(value) != {"ok", "supported", "download"} or value["ok"] is not True or
+                type(value["supported"]) is not bool or
+                type(value["download"]) is not bool or
+                value["download"] != value["supported"]):
+            raise BackupClientError(503, "Invalid portable backup broker reply")
+        return {"supported": value["supported"], "download": value["download"]}
 
     def plan(self) -> dict:
         value = self._request({"action": "host_plan"}, timeout_seconds=180)
@@ -348,6 +438,86 @@ class HostBackupBrokerClient(BackupBrokerClient):
         return _host_operation(self._request({"action": "host_start", "request_id": request_id,
                                              "expected_manifest_sha256": expected_manifest_sha256},
                                             timeout_seconds=180), identity=request_id)
+
+    def start_portable(self, request_id: str, expected_manifest_sha256: str) -> dict:
+        if not _host_id(request_id) or not isinstance(expected_manifest_sha256, str) or (
+                HOST_SHA.fullmatch(expected_manifest_sha256) is None):
+            raise BackupClientError(400, "Invalid portable backup request")
+        return _host_operation(self._request({"action": "host_portable_start",
+                                             "request_id": request_id,
+                                             "expected_manifest_sha256": expected_manifest_sha256},
+                                            timeout_seconds=180), identity=request_id)
+
+    def portable_status(self, request_id: str) -> dict:
+        if not _host_id(request_id):
+            raise BackupClientError(400, "Invalid portable backup request ID")
+        return _host_portable_operation(self._request({"action": "host_portable_status",
+                                                      "request_id": request_id},
+                                                     timeout_seconds=90), identity=request_id)
+
+    def verify_portable(self, request_id: str) -> dict:
+        if not _host_id(request_id):
+            raise BackupClientError(400, "Invalid portable backup request ID")
+        value = self._request({"action": "host_portable_verify", "request_id": request_id},
+                              timeout_seconds=2_200)
+        archive = value.get("archive")
+        receipt = value.get("receipt")
+        if (set(value) != {"ok", "request_id", "archive", "images_bytes", "receipt"} or
+                value["ok"] is not True or value["request_id"] != request_id or
+                type(value["images_bytes"]) is not int or
+                not 0 < value["images_bytes"] <= HOST_MAX_BYTES):
+            raise BackupClientError(503, "Invalid portable backup broker reply")
+        checked_archive = _host_archive(archive)
+        _host_receipt(receipt, archive_id=checked_archive["id"])
+        return value
+
+    def open_portable_stream(self, request_id: str, part: str) -> HostPortableStream:
+        if not _host_id(request_id) or part not in HOST_PARTS:
+            raise BackupClientError(400, "Invalid portable backup download")
+        raw = (json.dumps({"action": "host_portable_stream", "request_id": request_id,
+                           "part": part}, separators=(",", ":")) + "\n").encode("ascii")
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        reader = None
+        result = None
+        try:
+            connection.settimeout(5)
+            connection.connect(self.socket_path)
+            connection.sendall(raw)
+            # Root verifies the full pair and then hashes this descriptor
+            # before sending the first response byte.
+            connection.settimeout(3_400)
+            reader = connection.makefile("rb")
+            header = reader.readline(1025)
+            if not header.endswith(b"\n") or len(header) > 1024:
+                raise BackupClientError(503, "Invalid portable backup stream")
+            try:
+                value = json.loads(header, object_pairs_hook=_unique)
+            except (UnicodeError, ValueError) as exc:
+                raise BackupClientError(503, "Invalid portable backup stream") from exc
+            if isinstance(value, dict) and value == {"ok": False, "error": "HOST_STREAM_BUSY"}:
+                raise BackupClientError(429, "Too many host backup downloads")
+            if not isinstance(value, dict) or value.get("ok") is not True:
+                raise BackupClientError(503, "Portable backup stream unavailable")
+            if (set(value) != {"ok", "protocol", "request_id", "part", "bytes", "sha256"} or
+                    value["protocol"] != HOST_DOWNLOAD_PROTOCOL or
+                    value["request_id"] != request_id or value["part"] != part or
+                    type(value["bytes"]) is not int or
+                    not 0 < value["bytes"] <= HOST_MAX_BYTES or
+                    not isinstance(value["sha256"], str) or
+                    HOST_SHA.fullmatch(value["sha256"]) is None or
+                    (part == "receipt" and value["bytes"] > 8192)):
+                raise BackupClientError(503, "Invalid portable backup stream")
+            connection.settimeout(45)
+            result = HostPortableStream(connection, reader, value["bytes"], value["sha256"])
+            return result
+        except (OSError, socket.timeout) as exc:
+            raise BackupClientError(503, "Portable backup broker unavailable") from exc
+        finally:
+            # Ownership transfers to HostPortableStream only after a valid header.
+            if result is None:
+                if reader is not None:
+                    reader.close()
+                connection.close()
 
     def recover(self, request_id: str) -> dict:
         if not _host_id(request_id):

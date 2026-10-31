@@ -10,10 +10,12 @@ a lost HTTP/socket response can be replayed without making a second backup.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import stat
 import struct
@@ -49,9 +51,18 @@ HOST_ERROR = re.compile(r"[A-Z][A-Z0-9_]{1,63}\Z")
 HOST_SCRIPT = Path("/opt/sovagrid-src/sovagrid-blueprint/deploy/host_backup.py")
 HOST_OPERATION_SCRIPT = Path(
     "/opt/sovagrid-src/sovagrid-blueprint/deploy/host_backup_orchestrator.py")
+HOST_IMAGE_SCRIPT = Path(
+    "/opt/sovagrid-src/sovagrid-blueprint/deploy/host_image_export.py")
+HOST_ARCHIVES = Path("/var/lib/sovagrid-host-backups")
+HOST_IMAGES = Path("/var/lib/sovagrid-host-image-exports")
 FEED_SCRIPT = Path("/opt/sovagrid-src/sovagrid-blueprint/deploy/release_feed.py")
 HOST_PROTOCOL = "sovagrid-host-backup-v1"
 HOST_OPERATION_PROTOCOL = "sovagrid-host-backup-operation-v1"
+HOST_IMAGE_PROTOCOL = "sovagrid-host-images-v1"
+HOST_DOWNLOAD_PROTOCOL = "sovagrid-host-download-v1"
+MAX_STREAM_CHILDREN = 2
+MAX_STREAM_SECONDS = 5_400
+MAX_STREAM_BYTES = 8 * 1024**3
 FEED_SHA = re.compile(r"[0-9a-f]{64}\Z")
 FEED_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 FEED_KEY_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -99,15 +110,21 @@ def _request(raw: bytes) -> dict:
             _canonical_id(value["target_id"]) and
             value["request_id"] != value["target_id"]):
         return value
-    if action in ("host_plan", "host_archives", "host_operations") and set(value) == {"action"}:
+    if action in ("host_plan", "host_archives", "host_operations",
+                  "host_portable_capabilities") and set(value) == {"action"}:
         return value
     if action == "host_verify" and set(value) == {"action", "id"} and isinstance(
             value["id"], str) and HOST_ID.fullmatch(value["id"]):
         return value
-    if action in ("host_status", "host_recover") and set(value) == {"action", "request_id"} and isinstance(
+    if action in ("host_status", "host_recover", "host_portable_status", "host_portable_verify") and set(value) == {"action", "request_id"} and isinstance(
             value["request_id"], str) and HOST_ID.fullmatch(value["request_id"]):
         return value
-    if action == "host_start" and set(value) == {
+    if (action == "host_portable_stream" and
+            set(value) == {"action", "request_id", "part"} and
+            isinstance(value["request_id"], str) and HOST_ID.fullmatch(value["request_id"]) and
+            value["part"] in ("archive", "images", "receipt")):
+        return value
+    if action in ("host_start", "host_portable_start") and set(value) == {
             "action", "request_id", "expected_manifest_sha256"} and isinstance(
             value["request_id"], str) and HOST_ID.fullmatch(value["request_id"]) and isinstance(
             value["expected_manifest_sha256"], str) and HOST_SHA.fullmatch(
@@ -145,7 +162,7 @@ def _request(raw: bytes) -> dict:
 
 def _host_command(script: Path, *arguments: str, timeout: int = 120) -> dict:
     """Execute only the two installed root helpers; never a shell or caller path."""
-    if script not in (HOST_SCRIPT, HOST_OPERATION_SCRIPT):
+    if script not in (HOST_SCRIPT, HOST_OPERATION_SCRIPT, HOST_IMAGE_SCRIPT):
         raise BackupError("HOST_UNAVAILABLE")
     try:
         result = subprocess.run(["/usr/bin/python3", "-B", "-I", str(script), *arguments],
@@ -160,7 +177,8 @@ def _host_command(script: Path, *arguments: str, timeout: int = 120) -> dict:
         value = json.loads(raw, object_pairs_hook=_unique)
     except (UnicodeError, ValueError) as exc:
         raise BackupError("HOST_UNAVAILABLE") from exc
-    expected = HOST_PROTOCOL if script == HOST_SCRIPT else HOST_OPERATION_PROTOCOL
+    expected = (HOST_PROTOCOL if script == HOST_SCRIPT else
+                HOST_IMAGE_PROTOCOL if script == HOST_IMAGE_SCRIPT else HOST_OPERATION_PROTOCOL)
     if not isinstance(value, dict) or value.get("protocol") != expected or type(value.get("ok")) is not bool:
         raise BackupError("HOST_UNAVAILABLE")
     if result.returncode != 0 or value["ok"] is False:
@@ -174,6 +192,31 @@ def _host_command(script: Path, *arguments: str, timeout: int = 120) -> dict:
 
 def _host_execute(payload: dict) -> dict:
     action = payload["action"]
+    if action == "host_portable_capabilities":
+        supported = True
+        for script, commands in ((HOST_OPERATION_SCRIPT,
+                                  (b"start-portable", b"portable-status")),
+                                 (HOST_IMAGE_SCRIPT, (b"verify-portable",))):
+            try:
+                info = script.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+                        info.st_nlink != 1 or info.st_mode & 0o022 or
+                        not 0 < info.st_size <= 1024 * 1024):
+                    supported = False
+                    break
+                source = script.read_bytes()
+                if len(source) != info.st_size or any(command not in source for command in commands):
+                    supported = False
+                    break
+            except OSError:
+                supported = False
+                break
+        return {"ok": True, "supported": supported, "download": supported}
+    if action in ("host_portable_status", "host_portable_verify"):
+        status = _host_command(HOST_OPERATION_SCRIPT, "portable-status", payload["request_id"])
+        if action == "host_portable_status":
+            return status
+        return _host_verify_portable(status, payload["request_id"])
     if action == "host_plan":
         source = _host_command(HOST_SCRIPT, "source", timeout=90)
         if (set(source) != {"ok", "protocol", "manifest_sha256"} or
@@ -198,11 +241,156 @@ def _host_execute(payload: dict) -> dict:
         return {"ok": True, "archive": value["archive"], "verified": value["verified"]}
     operation_arguments = {
         "host_start": ("start", payload.get("request_id"), payload.get("expected_manifest_sha256")),
+        "host_portable_start": ("start-portable", payload.get("request_id"), payload.get("expected_manifest_sha256")),
         "host_status": ("status", payload.get("request_id")),
         "host_operations": ("list",),
         "host_recover": ("recover", payload.get("request_id")),
     }[action]
     return _host_command(HOST_OPERATION_SCRIPT, *operation_arguments)
+
+
+def _host_verify_portable(status: dict, request_id: str) -> dict:
+    archive = status.get("archive")
+    receipt = status.get("image_receipt")
+    if (set(status) != {"ok", "protocol", "request_id", "phase", "archive", "error",
+                        "created_at", "image_receipt"} or
+            status["ok"] is not True or status["protocol"] != HOST_OPERATION_PROTOCOL or
+            status["request_id"] != request_id or status["phase"] != "complete" or
+            not isinstance(archive, dict) or not isinstance(archive.get("id"), str) or
+            HOST_ID.fullmatch(archive["id"]) is None or
+            type(archive.get("bytes")) is not int or not 0 < archive["bytes"] <= MAX_STREAM_BYTES or
+            not isinstance(receipt, dict)):
+        raise BackupError("HOST_NOT_READY")
+    checked = _host_command(HOST_IMAGE_SCRIPT, "verify-portable", archive["id"],
+                            timeout=2_100)
+    if (set(checked) != {"ok", "protocol", "id", "verified", "image_count", "bytes",
+                         "apply_available", "receipt", "platforms"} or
+            checked["id"] != archive["id"] or checked["verified"] is not True or
+            checked["receipt"] != receipt or type(checked["bytes"]) is not int or
+            not 0 < checked["bytes"] <= MAX_STREAM_BYTES):
+        raise BackupError("HOST_UNAVAILABLE")
+    return {"ok": True, "request_id": request_id, "archive": archive,
+            "images_bytes": checked["bytes"], "receipt": receipt}
+
+
+def _stream_open(path: Path, *, parent: Path, size: int | None) -> tuple[int, os.stat_result]:
+    """Open only an exact, root-owned regular file below a fixed private root."""
+    for directory in (*reversed(parent.parents), parent):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or
+                info.st_mode & 0o022 or
+                (directory in (HOST_ARCHIVES, HOST_IMAGES, parent) and
+                 stat.S_IMODE(info.st_mode) != 0o700)):
+            raise BackupError("HOST_UNAVAILABLE")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or
+            info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or
+            not 0 < info.st_size <= MAX_STREAM_BYTES or
+            (size is not None and info.st_size != size)):
+        os.close(fd)
+        raise BackupError("HOST_UNAVAILABLE")
+    return fd, info
+
+
+def _stream_send(connection: socket.socket, payload: dict) -> None:
+    """Stream one independently verified portable artifact with bounded memory."""
+    sent_header = False
+    fd = None
+    try:
+        request_id, part = payload["request_id"], payload["part"]
+        status = _host_command(HOST_OPERATION_SCRIPT, "portable-status", request_id)
+        checked = _host_verify_portable(status, request_id)
+        archive_id = checked["archive"]["id"]
+        receipt = checked["receipt"]
+        if part == "archive":
+            path = HOST_ARCHIVES / (archive_id + ".tar.gz")
+            parent = HOST_ARCHIVES
+            size = checked["archive"]["bytes"]
+            expected = receipt.get("host_archive_sha256")
+        elif part == "images":
+            parent = HOST_IMAGES / archive_id
+            path = parent / "images.tar"
+            size = checked["images_bytes"]
+            expected = receipt.get("images_sha256")
+        else:
+            parent = HOST_IMAGES / archive_id
+            path = parent / "receipt.json"
+            size = None
+            expected = None
+        if part != "receipt" and (not isinstance(expected, str) or
+                                  HOST_SHA.fullmatch(expected) is None):
+            raise BackupError("HOST_UNAVAILABLE")
+        fd, before = _stream_open(path, parent=parent, size=size)
+        if part == "receipt":
+            if before.st_size > 8192:
+                raise BackupError("HOST_UNAVAILABLE")
+            raw = bytearray()
+            while len(raw) < before.st_size:
+                block = os.read(fd, before.st_size - len(raw))
+                if not block:
+                    raise BackupError("HOST_UNAVAILABLE")
+                raw.extend(block)
+            try:
+                parsed = json.loads(raw, object_pairs_hook=_unique)
+            except (UnicodeError, ValueError) as exc:
+                raise BackupError("HOST_UNAVAILABLE") from exc
+            if parsed != receipt:
+                raise BackupError("HOST_UNAVAILABLE")
+            expected = hashlib.sha256(raw).hexdigest()
+            os.lseek(fd, 0, os.SEEK_SET)
+        # The verifier checks the whole pair; bind the descriptor we will
+        # actually send to its receipt digest before emitting HTTP headers.
+        preflight = hashlib.sha256()
+        counted = 0
+        deadline = time.monotonic() + 1_200
+        while counted < before.st_size:
+            if time.monotonic() > deadline:
+                raise BackupError("HOST_UNAVAILABLE")
+            block = os.read(fd, min(131072, before.st_size - counted))
+            if not block:
+                raise BackupError("HOST_UNAVAILABLE")
+            preflight.update(block)
+            counted += len(block)
+        current = os.fstat(fd)
+        if (preflight.hexdigest() != expected or
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                 before.st_ctime_ns) !=
+                (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns,
+                 current.st_ctime_ns)):
+            raise BackupError("HOST_UNAVAILABLE")
+        os.lseek(fd, 0, os.SEEK_SET)
+        header = {"ok": True, "protocol": HOST_DOWNLOAD_PROTOCOL,
+                  "request_id": request_id, "part": part,
+                  "bytes": before.st_size, "sha256": expected}
+        connection.settimeout(30)
+        connection.sendall(_response(header))
+        sent_header = True
+        digest = hashlib.sha256()
+        count = 0
+        while count < before.st_size:
+            block = os.read(fd, min(131072, before.st_size - count))
+            if not block:
+                raise BackupError("HOST_UNAVAILABLE")
+            digest.update(block)
+            connection.sendall(block)
+            count += len(block)
+        after = os.fstat(fd)
+        if (digest.hexdigest() != expected or
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                 before.st_ctime_ns) !=
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                 after.st_ctime_ns)):
+            raise BackupError("HOST_UNAVAILABLE")
+    except (BackupError, OSError, ValueError, TypeError):
+        if not sent_header:
+            try:
+                connection.sendall(_response({"ok": False, "error": "HOST_UNAVAILABLE"}))
+            except (OSError, socket.timeout):
+                pass
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _feed_status_shape(value: object) -> bool:
@@ -436,6 +624,8 @@ class BackupBroker:
 
     def execute(self, payload: dict) -> dict:
         action = payload["action"]
+        if action == "host_portable_stream":
+            raise BackupError("HOST_STREAM_REQUIRED")
         if action.startswith("public_"):
             try:
                 return self.public_web.execute(
@@ -530,7 +720,19 @@ def _peer_uid(connection: socket.socket) -> int:
     return uid
 
 
-def handle(connection: socket.socket, broker: BackupBroker) -> None:
+def _reap_streams(children: set[int]) -> None:
+    for pid in tuple(children):
+        try:
+            finished, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            finished = pid
+        if finished:
+            children.discard(pid)
+
+
+def handle(connection: socket.socket, broker: BackupBroker, *,
+           stream_children: set[int] | None = None,
+           listener: socket.socket | None = None) -> None:
     connection.settimeout(10)
     try:
         if _peer_uid(connection) != PEER_UID:
@@ -544,6 +746,39 @@ def handle(connection: socket.socket, broker: BackupBroker) -> None:
             if b"\n" in chunk:
                 break
         payload = _request(bytes(raw))
+        if payload["action"] in ("host_portable_stream", "host_portable_verify"):
+            if stream_children is None:
+                if payload["action"] == "host_portable_stream":
+                    _stream_send(connection, payload)
+                else:
+                    connection.sendall(_response(broker.execute(payload)))
+                return
+            _reap_streams(stream_children)
+            if len(stream_children) >= MAX_STREAM_CHILDREN or listener is None:
+                raise BackupError("HOST_STREAM_BUSY")
+            pid = os.fork()
+            if pid:
+                stream_children.add(pid)
+                return
+            # A streaming child only owns this accepted connection. The root
+            # broker keeps accepting normal control requests independently.
+            listener.close()
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            signal.alarm(MAX_STREAM_SECONDS)
+            try:
+                if payload["action"] == "host_portable_stream":
+                    _stream_send(connection, payload)
+                else:
+                    try:
+                        answer = broker.execute(payload)
+                    except BackupError as exc:
+                        answer = {"ok": False, "error": str(exc)}
+                    except (OSError, ValueError, TypeError):
+                        answer = {"ok": False, "error": "BACKUP_FAILED"}
+                    connection.sendall(_response(answer))
+            finally:
+                connection.close()
+                os._exit(0)
         result = broker.execute(payload)
     except BackupError as exc:
         result = {"ok": False, "error": str(exc)}
@@ -571,10 +806,12 @@ def main() -> None:
     if listener.getsockname() != str(SOCKET_PATH):
         raise SystemExit("unexpected socket path")
     broker = BackupBroker()
+    stream_children: set[int] = set()
+    signal.signal(signal.SIGCHLD, lambda _signal, _frame: _reap_streams(stream_children))
     while True:
         connection, _ = listener.accept()
         with connection:
-            handle(connection, broker)
+            handle(connection, broker, stream_children=stream_children, listener=listener)
 
 
 if __name__ == "__main__":

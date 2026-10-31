@@ -89,6 +89,10 @@ class HubApp:
         self.local_web = LocalSettingsClient() if local_web is None else local_web
         self.backup_lock = threading.Lock()
         self.host_backup_lock = threading.Lock()
+        self.host_download_lock = threading.Lock()
+        # One-use, short-lived browser attachment grants. Bearer credentials
+        # never enter a download URL or a browser-readable cookie.
+        self.host_download_grants: dict[str, tuple[float, str, str, str, str]] = {}
         self.release_feed_lock = threading.Lock()
         self.external_agent_update_lock = threading.Lock()
         self.public_web_lock = threading.Lock()
@@ -102,6 +106,32 @@ class HubApp:
         self.login_attempts: dict[str, tuple[int, float, float]] = {}
         self.ssh_grant_attempts: dict[str, tuple[int, float, float]] = {}
         self.password_attempts: dict[str, tuple[int, float, float]] = {}
+
+    def grant_host_download(self, request_id: str, part: str, token: str,
+                            source_ip: str) -> str:
+        secret = secrets.token_urlsafe(32)
+        key = hashlib.sha256(secret.encode("ascii")).hexdigest()
+        with self.host_download_lock:
+            now = time.monotonic()
+            self.host_download_grants = {
+                item: record for item, record in self.host_download_grants.items()
+                if record[0] > now}
+            if len(self.host_download_grants) >= 64:
+                raise BackupClientError(429, "Too many pending downloads")
+            self.host_download_grants[key] = (now + 60, request_id, part, token, source_ip)
+        return secret
+
+    def consume_host_download(self, secret: str, request_id: str, part: str,
+                              source_ip: str) -> str | None:
+        if not isinstance(secret, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", secret) is None:
+            return None
+        key = hashlib.sha256(secret.encode("ascii")).hexdigest()
+        with self.host_download_lock:
+            record = self.host_download_grants.pop(key, None)
+        if (record is None or record[0] <= time.monotonic() or record[1:3] != (
+                request_id, part) or record[4] != source_ip):
+            return None
+        return record[3]
 
     def _set_panel_location(self, path: str, *, generation: int | None = None) -> None:
         # Status and apply results already cross a strict broker schema. Check
@@ -289,18 +319,106 @@ class HubHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logging.info("HTTP %s", format % args)
 
-    def _send(self, status: int, payload: dict):
+    def _send(self, status: int, payload: dict, *, headers: dict[str, str] | None = None):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if headers:
+            for name, value in headers.items():
+                self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
     def _error(self, status: int, message: str):
         self._send(status, {"error": message})
+
+    def _host_download_cookie(self) -> str:
+        headers = self.headers.get_all("Cookie", [])
+        if len(headers) != 1 or len(headers[0]) > 1024:
+            return ""
+        found = []
+        for item in headers[0].split(";"):
+            name, separator, value = item.strip().partition("=")
+            if separator and name == "sg_host_download":
+                found.append(value)
+        return found[0] if len(found) == 1 else ""
+
+    def _host_cookie_header(self, secret: str, *, expire: bool = False) -> str:
+        path = "/api/v1/host-backups/operations/"
+        value = f"sg_host_download={secret}; Path={path}; HttpOnly; SameSite=Strict"
+        if self._host_download_is_https():
+            value += "; Secure"
+        return value + ("; Max-Age=0" if expire else "; Max-Age=60")
+
+    def _host_download_is_https(self) -> bool:
+        proto = (self.headers.get("X-Forwarded-Proto", "http")
+                 if self.client_address[0] in self.app.trusted_proxies else "http")
+        return proto == "https"
+
+    def _host_download_transport_ok(self) -> bool:
+        if self._host_download_is_https():
+            return True
+        raw_host = self.headers.get("Host", "").lower()
+        host = ((raw_host.split("]", 1)[0] + "]") if raw_host.startswith("[")
+                else raw_host.split(":", 1)[0])
+        return host in ("127.0.0.1", "[::1]", "localhost")
+
+    def _serve_host_portable_download(self, request_id: str, part: str) -> None:
+        if not self._host_download_transport_ok():
+            self._error(403, "HTTPS or a local SSH tunnel is required")
+            return
+        if urlsplit(self.path).query:
+            self._error(400, "Unexpected download query parameters")
+            return
+        secret = self._host_download_cookie()
+        token = self.app.consume_host_download(secret, request_id, part,
+                                               self._source_ip())
+        if token is None or not self.app.store.unrestricted_admin(token):
+            self._error(401, "Download grant expired or already used")
+            return
+        try:
+            self.app.store.audit_host_backup_download(
+                request_id, part, "started", session_token=token)
+            stream = self.app.host_backups.open_portable_stream(request_id, part)
+        except BackupClientError as exc:
+            self._error(exc.status, str(exc))
+            return
+        filenames = {"archive": "host.tar.gz", "images": "images.tar",
+                     "receipt": "receipt.json"}
+        with stream:
+            try:
+                self.connection.settimeout(45)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", "attachment; filename=\"sovagrid-" +
+                                 request_id + "-" + filenames[part] + "\"")
+                self.send_header("Content-Length", str(stream.size))
+                self.send_header("X-SovaGrid-SHA256", stream.sha256)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Set-Cookie", self._host_cookie_header("", expire=True))
+                self.end_headers()
+                while True:
+                    block = stream.read()
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                if stream.remaining == 0:
+                    try:
+                        self.app.store.audit_host_backup_download(
+                            request_id, part, "completed", session_token=token)
+                    except (AuthenticationError, AuthorizationError):
+                        # A logout while bytes were in flight cannot turn an
+                        # already completed binary response into JSON.
+                        pass
+            except (BackupClientError, OSError, socket.timeout):
+                # After headers, a partial attachment must end as a failed
+                # transport; JSON cannot be appended to binary content.
+                self.close_connection = True
 
     def _body(self, max_size: int = MAX_BODY, *, reject_duplicate_keys: bool = False):
         if self.headers.get_content_type() != "application/json":
@@ -718,17 +836,31 @@ class HubHandler(BaseHTTPRequestHandler):
                 self._error(exc.status, str(exc))
             return
         host_base = "/api/v1/host-backups"
+        host_portable_download = re.fullmatch(
+            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable/download/(archive|images|receipt)",
+            url.path)
+        if host_portable_download:
+            self._serve_host_portable_download(host_portable_download.group(1),
+                                               host_portable_download.group(2))
+            return
+        host_portable_status = re.fullmatch(
+            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable", url.path)
+        host_portable_verify = re.fullmatch(
+            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable/verify", url.path)
         host_status = re.fullmatch(r"/api/v1/host-backups/operations/([0-9a-f]{32})", url.path)
         host_verify = re.fullmatch(r"/api/v1/host-backups/archives/([0-9a-f]{32})/verify", url.path)
         if url.path in (host_base + "/plan", host_base + "/archives",
-                        host_base + "/operations") or host_status or host_verify:
+                        host_base + "/operations", host_base + "/portable/capabilities") or host_status or host_verify or (
+                        host_portable_status or host_portable_verify):
             if not self._admin():
                 return
             if url.query:
                 self._error(400, "Unexpected host backup query parameters")
                 return
             try:
-                if url.path == host_base + "/plan":
+                if url.path == host_base + "/portable/capabilities":
+                    result = self.app.host_backups.portable_capabilities()
+                elif url.path == host_base + "/plan":
                     result = self.app.host_backups.plan()
                 elif url.path == host_base + "/archives":
                     result = self.app.host_backups.archives()
@@ -736,6 +868,10 @@ class HubHandler(BaseHTTPRequestHandler):
                     result = self.app.host_backups.operations()
                 elif host_verify:
                     result = self.app.host_backups.verify_archive(host_verify.group(1))
+                elif host_portable_status:
+                    result = self.app.host_backups.portable_status(host_portable_status.group(1))
+                elif host_portable_verify:
+                    result = self.app.host_backups.verify_portable(host_portable_verify.group(1))
                 else:
                     result = self.app.host_backups.operation_status(host_status.group(1))
                 if not self.app.store.unrestricted_admin(self._token()):
@@ -1457,9 +1593,48 @@ class HubHandler(BaseHTTPRequestHandler):
                 self.app.local_web_lock.release()
             return
         host_base = "/api/v1/host-backups"
+        host_portable_start = path == host_base + "/portable/operations"
+        host_download_grant = re.fullmatch(
+            r"/api/v1/host-backups/operations/([0-9a-f]{32})/portable/download-grants/(archive|images|receipt)",
+            path)
+        if host_download_grant:
+            if not self._admin() or not self._public_web_origin_ok():
+                return
+            if not self._host_download_transport_ok():
+                self._error(403, "HTTPS or a local SSH tunnel is required")
+                return
+            if urlsplit(self.path).query:
+                self._error(400, "Unexpected download grant query parameters")
+                return
+            data = self._body(64, reject_duplicate_keys=True)
+            if data is None:
+                return
+            if data != {}:
+                self._error(400, "Expected an empty object")
+                return
+            request_id, part = host_download_grant.groups()
+            try:
+                status = self.app.host_backups.portable_status(request_id)
+                if status["phase"] != "complete" or status["image_receipt"] is None:
+                    self._error(409, "Portable backup is not complete")
+                    return
+                if not self.app.store.unrestricted_admin(self._token()):
+                    self._error(401, "Unauthorized")
+                    return
+                self.app.store.audit_host_backup_download(
+                    request_id, part, "granted", session_token=self._token())
+                secret = self.app.grant_host_download(
+                    request_id, part, self._token(), self._source_ip())
+                self._send(200, {"request_id": request_id, "part": part,
+                                 "expires_in_seconds": 60},
+                           headers={"Set-Cookie": self._host_cookie_header(secret),
+                                    "Referrer-Policy": "no-referrer"})
+            except BackupClientError as exc:
+                self._error(exc.status, str(exc))
+            return
         host_recover = re.fullmatch(
             r"/api/v1/host-backups/operations/([0-9a-f]{32})/recover", path)
-        if path == host_base + "/operations" or host_recover:
+        if path == host_base + "/operations" or host_portable_start or host_recover:
             if not self._admin():
                 return
             if urlsplit(self.path).query:
@@ -1490,8 +1665,11 @@ class HubHandler(BaseHTTPRequestHandler):
                 return
             try:
                 self.app.store.audit_host_backup_request(
-                    request_id, recover=bool(host_recover), session_token=self._token())
+                    request_id, recover=bool(host_recover), portable=host_portable_start,
+                    session_token=self._token())
                 result = (self.app.host_backups.recover(request_id) if host_recover else
+                          self.app.host_backups.start_portable(request_id, digest)
+                          if host_portable_start else
                           self.app.host_backups.start(request_id, digest))
                 if not self.app.store.unrestricted_admin(self._token()):
                     self._error(401, "Unauthorized")
