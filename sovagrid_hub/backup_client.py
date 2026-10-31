@@ -11,7 +11,7 @@ import socket
 import uuid
 from datetime import datetime, timedelta
 
-from .backup_broker import MAX_RESPONSE, SOCKET_PATH
+from .backup_broker import MAX_RESPONSE, SOCKET_PATH, FEED_SHA, _feed_status_shape
 
 
 MAX_DATABASE_BYTES = 4 * 1024**3
@@ -128,6 +128,16 @@ class BackupBrokerClient:
                 raise BackupClientError(503, "Invalid backup broker reply")
             if code == "CREATE_RATE_LIMITED":
                 raise BackupClientError(429, "Wait before creating another backup")
+            if code == "FEED_STATE_CHANGED":
+                raise BackupClientError(409, "STATE_CHANGED")
+            if code == "FEED_HUB_ONLY_UNSUPPORTED":
+                raise BackupClientError(409, "HUB_ONLY_UNSUPPORTED")
+            if code == "FEED_UNCONFIGURED_TRUST":
+                raise BackupClientError(503, "UNCONFIGURED_TRUST")
+            if code == "FEED_TIMER_UNAVAILABLE":
+                raise BackupClientError(503, "TIMER_UNAVAILABLE")
+            if code == "FEED_UNAVAILABLE":
+                raise BackupClientError(503, "FEED_UNAVAILABLE")
             if code == "UPDATE_BUSY":
                 raise BackupClientError(503, "Server update or restore is busy")
             if code == "FILE_UNAVAILABLE":
@@ -323,3 +333,37 @@ class HostBackupBrokerClient(BackupBrokerClient):
             raise BackupClientError(400, "Invalid host backup request ID")
         return _host_operation(self._request({"action": "host_recover", "request_id": request_id},
                                              timeout_seconds=90), identity=request_id)
+
+
+class ReleaseFeedBrokerClient(BackupBrokerClient):
+    """Restricted status and opt-in control through the existing root socket."""
+
+    def _feed_request(self, payload: dict, *, timeout_seconds: int) -> dict:
+        try:
+            return self._request(payload, timeout_seconds=timeout_seconds)
+        except BackupClientError as exc:
+            if exc.status == 503 and str(exc) not in {
+                "UNCONFIGURED_TRUST", "TIMER_UNAVAILABLE", "FEED_UNAVAILABLE"}:
+                raise BackupClientError(503, "FEED_UNAVAILABLE") from exc
+            raise
+
+    @staticmethod
+    def _status(value: dict) -> dict:
+        if set(value) != {"ok", "status"} or value["ok"] is not True or not _feed_status_shape(value["status"]):
+            raise BackupClientError(503, "FEED_UNAVAILABLE")
+        return value["status"]
+
+    def status(self) -> dict:
+        return self._status(self._feed_request({"action": "feed_status"}, timeout_seconds=75))
+
+    def enable(self, expected_state: str) -> dict:
+        if not isinstance(expected_state, str) or FEED_SHA.fullmatch(expected_state) is None:
+            raise BackupClientError(400, "INVALID_REQUEST")
+        return self._status(self._feed_request({"action": "feed_enable", "expected_state": expected_state},
+                                               timeout_seconds=115))
+
+    def disable(self, expected_state: str) -> dict:
+        if not isinstance(expected_state, str) or FEED_SHA.fullmatch(expected_state) is None:
+            raise BackupClientError(400, "INVALID_REQUEST")
+        return self._status(self._feed_request({"action": "feed_disable", "expected_state": expected_state},
+                                               timeout_seconds=115))

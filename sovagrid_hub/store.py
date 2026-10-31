@@ -1434,6 +1434,18 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
                                 else "host_backup_create_requested",
                                 subject_id=request_id)
 
+    def audit_release_feed_request(self, action: str, expected_state: str, *,
+                                   session_token: str) -> None:
+        if (action not in ("enable", "disable") or
+                not isinstance(expected_state, str) or
+                re.fullmatch(r"[0-9a-f]{64}", expected_state) is None):
+            raise ValueError("Invalid release feed request")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            identity = self._require_unrestricted_admin(db, session_token)
+            self._audit_account(db, identity, "release_feed_" + action + "_requested",
+                                details={"expected_state": expected_state})
+
     def audit_public_web_request(self, action: str, config_sha256: str, *,
                                  request_id: str | None, session_token: str) -> None:
         try:

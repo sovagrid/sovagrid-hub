@@ -45,8 +45,16 @@ HOST_ERROR = re.compile(r"[A-Z][A-Z0-9_]{1,63}\Z")
 HOST_SCRIPT = Path("/opt/sovagrid-src/sovagrid-blueprint/deploy/host_backup.py")
 HOST_OPERATION_SCRIPT = Path(
     "/opt/sovagrid-src/sovagrid-blueprint/deploy/host_backup_orchestrator.py")
+FEED_SCRIPT = Path("/opt/sovagrid-src/sovagrid-blueprint/deploy/release_feed.py")
 HOST_PROTOCOL = "sovagrid-host-backup-v1"
 HOST_OPERATION_PROTOCOL = "sovagrid-host-backup-operation-v1"
+FEED_SHA = re.compile(r"[0-9a-f]{64}\Z")
+FEED_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
+FEED_KEY_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
+FEED_STATUS_FIELDS = frozenset(("format", "channel", "enabled", "key_id", "available_keys",
+                               "timer_installed", "timer_enabled", "timer_active",
+                               "manual_candidate_active", "installed_manifest_sha256",
+                               "ledger", "state_revision"))
 
 
 def _unique(pairs):
@@ -100,6 +108,13 @@ def _request(raw: bytes) -> dict:
             value["request_id"], str) and HOST_ID.fullmatch(value["request_id"]) and isinstance(
             value["expected_manifest_sha256"], str) and HOST_SHA.fullmatch(
             value["expected_manifest_sha256"]):
+        return value
+    if action == "feed_status" and set(value) == {"action"}:
+        return value
+    if (action in ("feed_enable", "feed_disable") and
+            set(value) == {"action", "expected_state"} and
+            isinstance(value["expected_state"], str) and
+            FEED_SHA.fullmatch(value["expected_state"]) is not None):
         return value
     if action in ("public_status", "public_preview", "public_apply"):
         try:
@@ -180,6 +195,82 @@ def _host_execute(payload: dict) -> dict:
         "host_recover": ("recover", payload.get("request_id")),
     }[action]
     return _host_command(HOST_OPERATION_SCRIPT, *operation_arguments)
+
+
+def _feed_status_shape(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != FEED_STATUS_FIELDS:
+        return False
+    ledger = value["ledger"]
+    keys = value["available_keys"]
+    return (
+        type(value["format"]) is int and value["format"] == 1 and value["channel"] == "stable" and
+        type(value["enabled"]) is bool and
+        (value["key_id"] is None or isinstance(value["key_id"], str) and
+         FEED_KEY_ID.fullmatch(value["key_id"]) is not None) and
+        isinstance(keys, dict) and len(keys) <= 8 and all(
+            isinstance(key, str) and FEED_KEY_ID.fullmatch(key) is not None and
+            isinstance(digest, str) and FEED_SHA.fullmatch(digest) is not None
+            for key, digest in keys.items()) and
+        all(type(value[name]) is bool for name in (
+            "timer_installed", "timer_enabled", "timer_active", "manual_candidate_active")) and
+        (value["installed_manifest_sha256"] is None or
+         isinstance(value["installed_manifest_sha256"], str) and
+         FEED_SHA.fullmatch(value["installed_manifest_sha256"]) is not None) and
+        isinstance(value["state_revision"], str) and
+        FEED_SHA.fullmatch(value["state_revision"]) is not None and
+        isinstance(ledger, dict) and set(ledger) == {
+            "format", "highest_sequence", "highest_version", "highest_issued_at", "last_seen_at"} and
+        type(ledger["format"]) is int and ledger["format"] == 1 and
+        all(type(ledger[name]) is int and ledger[name] >= 0 for name in (
+            "highest_sequence", "highest_issued_at", "last_seen_at")) and
+        isinstance(ledger["highest_version"], str) and
+        FEED_VERSION.fullmatch(ledger["highest_version"]) is not None)
+
+
+def _feed_command(*arguments: str, timeout: int = 65) -> bytes:
+    """Run only the installed release-feed CLI, never caller-selected code."""
+    try:
+        result = subprocess.run(["/usr/bin/python3", "-B", "-I", str(FEED_SCRIPT), *arguments],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+                                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BackupError("FEED_UNAVAILABLE") from exc
+    raw = result.stdout
+    if not 0 < len(raw) <= 8192 or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise BackupError("FEED_UNAVAILABLE")
+    if result.returncode == 40:
+        match = re.fullmatch(rb"SG_RELEASE_FEED_REFUSE:([A-Z][A-Z0-9_]{1,63})\n", raw)
+        code = match.group(1).decode("ascii") if match else ""
+        mapped = {"STATE_CHANGED", "HUB_ONLY_UNSUPPORTED", "UNCONFIGURED_TRUST"}
+        raise BackupError("FEED_" + code if code in mapped else
+                          "FEED_TIMER_UNAVAILABLE" if code in ("TIMER_NOT_INSTALLED", "TIMER_UNAVAILABLE")
+                          else "FEED_UNAVAILABLE")
+    if result.returncode != 0:
+        raise BackupError("FEED_UNAVAILABLE")
+    return raw
+
+
+def _feed_execute(payload: dict) -> dict:
+    action = payload["action"]
+    if action == "feed_status":
+        raw = _feed_command("status")
+    else:
+        command = "enable" if action == "feed_enable" else "disable"
+        response = _feed_command(command, "--expected-state", payload["expected_state"], timeout=100)
+        accepted = (re.fullmatch(rb"SG_RELEASE_FEED:ENABLED:[a-z0-9][a-z0-9-]{0,63}\n", response)
+                    is not None if action == "feed_enable"
+                    else response == b"SG_RELEASE_FEED:DISABLED\n")
+        if not accepted:
+            raise BackupError("FEED_UNAVAILABLE")
+        raw = _feed_command("status")
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique)
+    except (UnicodeError, ValueError, BackupError) as exc:
+        raise BackupError("FEED_UNAVAILABLE") from exc
+    if not _feed_status_shape(value):
+        raise BackupError("FEED_UNAVAILABLE")
+    return {"ok": True, "status": value}
 
 
 class BackupBroker:
@@ -315,6 +406,8 @@ class BackupBroker:
                 raise BackupError("LOCAL_" + exc.code) from exc
         if action.startswith("host_"):
             return _host_execute(payload)
+        if action.startswith("feed_"):
+            return _feed_execute(payload)
         if action == "list":
             return {"ok": True, **self.manager.list()}
         if action == "verify":

@@ -46,6 +46,7 @@ from .vpn_status import read_vpn_status
 from .telegram_runtime import TelegramActivationError, TelegramModeError, TelegramStorageError
 from .server_acl import AccessConflict
 from .backup_client import (BackupBrokerClient, BackupClientError, HostBackupBrokerClient,
+                            ReleaseFeedBrokerClient,
                             HOST_ID, HOST_SHA, canonical_id as backup_id)
 from .public_settings import (PublicSettingsClient, PublicSettingsClientError,
                               PublicSettingsError, PANEL_PATH, valid_hash as public_hash,
@@ -61,7 +62,7 @@ BUNDLE_MANIFEST_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 class HubApp:
     def __init__(self, store: Store, telegram=None, trusted_proxies: set[str] | None = None,
                  vpn_status_path: str = "/vpn/status.json", backups=None, host_backups=None,
-                 public_web=None, local_web=None):
+                 public_web=None, local_web=None, release_feed=None):
         self.store = store
         # The image build pins this public digest. A missing or malformed pin
         # must never be reported as a compatible running Hub.
@@ -79,10 +80,12 @@ class HubApp:
         self.agent_maintenance_epoch = secrets.token_hex(16)
         self.backups = BackupBrokerClient() if backups is None else backups
         self.host_backups = HostBackupBrokerClient() if host_backups is None else host_backups
+        self.release_feed = ReleaseFeedBrokerClient() if release_feed is None else release_feed
         self.public_web = PublicSettingsClient() if public_web is None else public_web
         self.local_web = LocalSettingsClient() if local_web is None else local_web
         self.backup_lock = threading.Lock()
         self.host_backup_lock = threading.Lock()
+        self.release_feed_lock = threading.Lock()
         self.public_web_lock = threading.Lock()
         self.local_web_lock = threading.Lock()
         self._panel_location_lock = threading.Lock()
@@ -382,6 +385,7 @@ class HubHandler(BaseHTTPRequestHandler):
             return False
         global_admin = (path.startswith(("/api/v1/users", "/api/v1/telegram", "/api/v1/backups",
                                          "/api/v1/host-backups",
+                                         "/api/v1/release-feed",
                                          "/api/v1/public-web",
                                          "/api/v1/local-web",
                                          "/api/v1/agent-enrollments")) or
@@ -615,6 +619,21 @@ class HubHandler(BaseHTTPRequestHandler):
                 self._error(503, "Panel location is not ready")
             else:
                 self._send(200, {"panel_path": path})
+            return
+        if url.path == "/api/v1/release-feed":
+            if not self._admin():
+                return
+            if url.query:
+                self._error(400, "INVALID_REQUEST")
+                return
+            try:
+                result = self.app.release_feed.status()
+                if not self.app.store.unrestricted_admin(self._token()):
+                    self._error(401, "Unauthorized")
+                    return
+                self._send(200, result)
+            except BackupClientError as exc:
+                self._error(exc.status, str(exc))
             return
         if url.path == "/api/v1/public-web":
             if not self._admin():
@@ -1111,6 +1130,37 @@ class HubHandler(BaseHTTPRequestHandler):
     def _post(self):
         self._body_auth = None
         path = urlsplit(self.path).path
+        if path in ("/api/v1/release-feed/enable", "/api/v1/release-feed/disable"):
+            if not self._admin() or not self._public_web_origin_ok():
+                return
+            if urlsplit(self.path).query:
+                self._error(400, "INVALID_REQUEST")
+                return
+            data = self._body(256, reject_duplicate_keys=True)
+            if data is None:
+                return
+            if (not isinstance(data, dict) or set(data) != {"expected_state"} or
+                    not isinstance(data["expected_state"], str) or
+                    BUNDLE_MANIFEST_SHA256.fullmatch(data["expected_state"]) is None):
+                self._error(400, "INVALID_REQUEST")
+                return
+            if not self.app.release_feed_lock.acquire(blocking=False):
+                self._error(409, "STATE_CHANGED")
+                return
+            try:
+                action = path.rsplit("/", 1)[1]
+                self.app.store.audit_release_feed_request(
+                    action, data["expected_state"], session_token=self._token())
+                result = getattr(self.app.release_feed, action)(data["expected_state"])
+                if not self.app.store.unrestricted_admin(self._token()):
+                    self._error(401, "Unauthorized")
+                    return
+                self._send(200, result)
+            except BackupClientError as exc:
+                self._error(exc.status, str(exc))
+            finally:
+                self.app.release_feed_lock.release()
+            return
         maintenance = re.fullmatch(
             r"/api/v1/servers/([^/]+)/agent-maintenance/lease(?:/(renew|release))?", path)
         if maintenance:
