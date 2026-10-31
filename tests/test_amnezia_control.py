@@ -46,6 +46,10 @@ class AmneziaActionTests(unittest.TestCase):
               "address": "10.22.0.9", "endpoint_host": "VPN.Example.COM",
               "public_key": PUBLIC, "route": "full"},
              f"/usr/local/bin/sovagrid-amnezia-ctl add-profile awg2 phone_1 10.22.0.9 vpn.example.com {PUBLIC} --route full"),
+            ({"action": "add-profile", "target": "awg2", "client": "phone_1",
+              "address": "auto", "endpoint_host": "vpn.example.com",
+              "public_key": PUBLIC, "route": "split"},
+             f"/usr/local/bin/sovagrid-amnezia-ctl add-profile awg2 phone_1 auto vpn.example.com {PUBLIC} --route split"),
             ({"action": "sealed-export", "target": "awg2", "client": "phone_1",
               "public_key": PUBLIC},
              f"/usr/local/bin/sovagrid-amnezia-ctl sealed-export awg2 phone_1 {PUBLIC}"),
@@ -81,6 +85,9 @@ class AmneziaActionTests(unittest.TestCase):
             {"action": "sealed-export", "target": "awg2", "client": "phone_1", "public_key": "bad"},
             {"action": "add-profile", "target": "awg2", "client": "phone_1",
              "address": "10.22.0.09", "endpoint_host": "vpn.example.com",
+             "public_key": PUBLIC, "route": "full"},
+            {"action": "add-profile", "target": "awg2", "client": "phone_1",
+             "address": "AUTO", "endpoint_host": "vpn.example.com",
              "public_key": PUBLIC, "route": "full"},
         ):
             with self.subTest(body=body), self.assertRaises(ValueError):

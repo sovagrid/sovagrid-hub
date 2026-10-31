@@ -81,6 +81,8 @@ def _client(value: object) -> str:
 def _address(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("Invalid client IPv4 address")
+    if value == "auto":
+        return value
     try:
         parsed = ipaddress.IPv4Address(value)
     except ipaddress.AddressValueError as exc:
