@@ -382,14 +382,24 @@ class HubHandler(BaseHTTPRequestHandler):
         try:
             self.app.store.audit_host_backup_download(
                 request_id, part, "started", session_token=token)
-            stream = self.app.host_backups.open_portable_stream(request_id, part)
+            stream = self.app.host_backups.open_portable_stream(
+                request_id, part, cancel_socket=self.connection)
         except BackupClientError as exc:
+            if exc.status == 499:
+                self.close_connection = True
+                return
             self._error(exc.status, str(exc))
             return
         filenames = {"archive": "host.tar.gz", "images": "images.tar",
                      "receipt": "receipt.json"}
         with stream:
             try:
+                # The root broker may take many minutes to verify a large
+                # archive. A session revoked during that wait must never
+                # receive the first response byte.
+                if not self.app.store.unrestricted_admin(token):
+                    self._error(401, "Download authorization expired")
+                    return
                 self.connection.settimeout(45)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
@@ -402,11 +412,21 @@ class HubHandler(BaseHTTPRequestHandler):
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Set-Cookie", self._host_cookie_header("", expire=True))
                 self.end_headers()
+                authorized_bytes = 0
+                next_authorization = time.monotonic() + 1
                 while True:
                     block = stream.read()
                     if not block:
                         break
+                    if (authorized_bytes + len(block) > 1024 * 1024 or
+                            time.monotonic() >= next_authorization):
+                        if not self.app.store.unrestricted_admin(token):
+                            self.close_connection = True
+                            return
+                        authorized_bytes = 0
+                        next_authorization = time.monotonic() + 1
                     self.wfile.write(block)
+                    authorized_bytes += len(block)
                 if stream.remaining == 0:
                     try:
                         self.app.store.audit_host_backup_download(

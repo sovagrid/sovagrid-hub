@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import signal
 import socket
 import stat
@@ -160,17 +161,70 @@ def _request(raw: bytes) -> dict:
     raise BackupError("INVALID_REQUEST")
 
 
-def _host_command(script: Path, *arguments: str, timeout: int = 120) -> dict:
-    """Execute only the two installed root helpers; never a shell or caller path."""
+def _host_command_cancellable(command: list[str], timeout: int,
+                              connection: socket.socket) -> tuple[bytes, int]:
+    """Bound helper output and stop its process group when the caller leaves."""
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    output = bytearray()
+    completed = False
+    try:
+        if process.stdout is None:
+            raise BackupError("HOST_UNAVAILABLE")
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        deadline = time.monotonic() + timeout
+        eof = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BackupError("HOST_UNAVAILABLE")
+            watched = [connection] + ([] if eof else [process.stdout])
+            ready, _, _ = select.select(watched, [], [], min(1, remaining))
+            if connection in ready:
+                # After the one request, readability means EOF or unexpected
+                # extra input. Neither caller can use this result safely.
+                raise BackupError("HOST_UNAVAILABLE")
+            if not eof and process.stdout in ready:
+                block = os.read(descriptor, min(4096, MAX_RESPONSE + 1 - len(output)))
+                if block:
+                    output.extend(block)
+                    if len(output) > MAX_RESPONSE:
+                        raise BackupError("HOST_UNAVAILABLE")
+                else:
+                    eof = True
+            if eof and process.poll() is not None:
+                completed = True
+                return bytes(output), process.returncode
+    finally:
+        if not completed:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def _host_command(script: Path, *arguments: str, timeout: int = 120,
+                  cancel_connection: socket.socket | None = None) -> dict:
+    """Execute only the installed root helpers; never a shell or caller path."""
     if script not in (HOST_SCRIPT, HOST_OPERATION_SCRIPT, HOST_IMAGE_SCRIPT):
         raise BackupError("HOST_UNAVAILABLE")
     try:
-        result = subprocess.run(["/usr/bin/python3", "-B", "-I", str(script), *arguments],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+        command = ["/usr/bin/python3", "-B", "-I", str(script), *arguments]
+        if cancel_connection is None:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=timeout, check=False)
+            raw, returncode = result.stdout, result.returncode
+        else:
+            raw, returncode = _host_command_cancellable(command, timeout,
+                                                         cancel_connection)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BackupError("HOST_UNAVAILABLE") from exc
-    raw = result.stdout
     if not 0 < len(raw) <= MAX_RESPONSE or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
         raise BackupError("HOST_UNAVAILABLE")
     try:
@@ -181,7 +235,7 @@ def _host_command(script: Path, *arguments: str, timeout: int = 120) -> dict:
                 HOST_IMAGE_PROTOCOL if script == HOST_IMAGE_SCRIPT else HOST_OPERATION_PROTOCOL)
     if not isinstance(value, dict) or value.get("protocol") != expected or type(value.get("ok")) is not bool:
         raise BackupError("HOST_UNAVAILABLE")
-    if result.returncode != 0 or value["ok"] is False:
+    if returncode != 0 or value["ok"] is False:
         code = value.get("error")
         if (set(value) != {"ok", "protocol", "error"} or value["ok"] is not False or
                 not isinstance(code, str) or HOST_ERROR.fullmatch(code) is None):
@@ -249,7 +303,8 @@ def _host_execute(payload: dict) -> dict:
     return _host_command(HOST_OPERATION_SCRIPT, *operation_arguments)
 
 
-def _host_verify_portable(status: dict, request_id: str) -> dict:
+def _host_verify_portable(status: dict, request_id: str, *,
+                          cancel_connection: socket.socket | None = None) -> dict:
     archive = status.get("archive")
     receipt = status.get("image_receipt")
     if (set(status) != {"ok", "protocol", "request_id", "phase", "archive", "error",
@@ -262,7 +317,7 @@ def _host_verify_portable(status: dict, request_id: str) -> dict:
             not isinstance(receipt, dict)):
         raise BackupError("HOST_NOT_READY")
     checked = _host_command(HOST_IMAGE_SCRIPT, "verify-portable", archive["id"],
-                            timeout=2_100)
+                            timeout=2_100, cancel_connection=cancel_connection)
     if (set(checked) != {"ok", "protocol", "id", "verified", "image_count", "bytes",
                          "apply_available", "receipt", "platforms"} or
             checked["id"] != archive["id"] or checked["verified"] is not True or
@@ -299,8 +354,10 @@ def _stream_send(connection: socket.socket, payload: dict) -> None:
     fd = None
     try:
         request_id, part = payload["request_id"], payload["part"]
-        status = _host_command(HOST_OPERATION_SCRIPT, "portable-status", request_id)
-        checked = _host_verify_portable(status, request_id)
+        status = _host_command(HOST_OPERATION_SCRIPT, "portable-status", request_id,
+                               cancel_connection=connection)
+        checked = _host_verify_portable(status, request_id,
+                                        cancel_connection=connection)
         archive_id = checked["archive"]["id"]
         receipt = checked["receipt"]
         if part == "archive":
@@ -345,6 +402,8 @@ def _stream_send(connection: socket.socket, payload: dict) -> None:
         counted = 0
         deadline = time.monotonic() + 1_200
         while counted < before.st_size:
+            if select.select([connection], [], [], 0)[0]:
+                raise BackupError("HOST_UNAVAILABLE")
             if time.monotonic() > deadline:
                 raise BackupError("HOST_UNAVAILABLE")
             block = os.read(fd, min(131072, before.st_size - counted))

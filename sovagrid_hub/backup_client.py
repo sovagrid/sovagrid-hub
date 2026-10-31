@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import re
+import select
 import socket
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -464,7 +466,7 @@ class HostBackupBrokerClient(BackupBrokerClient):
         if not _host_id(request_id):
             raise BackupClientError(400, "Invalid portable backup request ID")
         value = self._request({"action": "host_portable_verify", "request_id": request_id},
-                              timeout_seconds=2_200)
+                              timeout_seconds=2_300)
         archive = value.get("archive")
         receipt = value.get("receipt")
         if (set(value) != {"ok", "request_id", "archive", "images_bytes", "receipt"} or
@@ -476,7 +478,8 @@ class HostBackupBrokerClient(BackupBrokerClient):
         _host_receipt(receipt, archive_id=checked_archive["id"])
         return value
 
-    def open_portable_stream(self, request_id: str, part: str) -> HostPortableStream:
+    def open_portable_stream(self, request_id: str, part: str, *,
+                             cancel_socket: socket.socket | None = None) -> HostPortableStream:
         if not _host_id(request_id) or part not in HOST_PARTS:
             raise BackupClientError(400, "Invalid portable backup download")
         raw = (json.dumps({"action": "host_portable_stream", "request_id": request_id,
@@ -490,9 +493,41 @@ class HostBackupBrokerClient(BackupBrokerClient):
             connection.sendall(raw)
             # Root verifies the full pair and then hashes this descriptor
             # before sending the first response byte.
-            connection.settimeout(3_400)
-            reader = connection.makefile("rb")
-            header = reader.readline(1025)
+            connection.settimeout(3_600)
+            if cancel_socket is None:
+                reader = connection.makefile("rb")
+                header = reader.readline(1025)
+            else:
+                # The browser can leave while root verifies the pair. Close
+                # our Unix connection promptly so its child can cancel work.
+                header_bytes = bytearray()
+                deadline = time.monotonic() + 3_600
+                watched_peer = cancel_socket
+                while len(header_bytes) <= 1024 and not header_bytes.endswith(b"\n"):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise BackupClientError(503, "Portable backup broker timed out")
+                    watched = [connection]
+                    if watched_peer is not None:
+                        watched.append(watched_peer)
+                    ready, _, _ = select.select(watched, [], [], min(1, remaining))
+                    if watched_peer is not None and watched_peer in ready:
+                        try:
+                            pending = watched_peer.recv(1, socket.MSG_PEEK)
+                        except OSError:
+                            pending = b""
+                        if not pending:
+                            raise BackupClientError(499, "Download client disconnected")
+                        # An HTTP peer may pipeline a later request. Do not
+                        # consume its bytes or spin on their readiness.
+                        watched_peer = None
+                    if connection in ready:
+                        chunk = connection.recv(1)
+                        if not chunk:
+                            break
+                        header_bytes.extend(chunk)
+                header = bytes(header_bytes)
+                reader = connection.makefile("rb")
             if not header.endswith(b"\n") or len(header) > 1024:
                 raise BackupClientError(503, "Invalid portable backup stream")
             try:

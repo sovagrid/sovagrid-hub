@@ -4,10 +4,12 @@
 """The Web backup route cannot turn a lost reply into a second snapshot."""
 
 import hashlib
+import http.client
 import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -21,7 +23,8 @@ from unittest import mock
 
 from sovagrid_hub.backup import BackupError, HubBackups, Layout
 from sovagrid_hub.backup_broker import (BackupBroker, _request, handle,
-                                        _host_execute, _stream_send)
+                                        _host_command_cancellable, _host_execute,
+                                        _stream_send)
 from sovagrid_hub.backup_client import (BackupBrokerClient, BackupClientError,
                                         HostBackupBrokerClient, _restore,
                                         _host_portable_operation)
@@ -415,6 +418,65 @@ class BackupBrokerTests(unittest.TestCase):
             caller.close()
             server.close()
 
+    def test_abandoned_portable_header_closes_broker_and_kills_helper(self):
+        path = str(Path(self.temp.name) / "abandoned.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(1)
+        ready = threading.Event()
+        ended = []
+
+        def serve():
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(4)
+                connection.recv(1024)
+                ready.set()
+                ended.append(connection.recv(1))
+
+        browser, browser_peer = socket.socketpair()
+        try:
+            server = threading.Thread(target=serve, daemon=True)
+            server.start()
+            errors = []
+
+            def fetch():
+                try:
+                    HostBackupBrokerClient(path).open_portable_stream(
+                        HOST_REQUEST_ID, "archive", cancel_socket=browser)
+                except BackupClientError as exc:
+                    errors.append(exc.status)
+
+            client = threading.Thread(target=fetch, daemon=True)
+            client.start()
+            self.assertTrue(ready.wait(2))
+            browser_peer.close()
+            client.join(3)
+            server.join(3)
+            self.assertFalse(client.is_alive())
+            self.assertFalse(server.is_alive())
+            self.assertEqual(errors, [499])
+            self.assertEqual(ended, [b""])
+        finally:
+            browser.close()
+            browser_peer.close()
+            listener.close()
+
+        caller, broker = socket.socketpair()
+        try:
+            timer = threading.Timer(0.1, caller.close)
+            timer.start()
+            started = time.monotonic()
+            with self.assertRaisesRegex(BackupError, "HOST_UNAVAILABLE"):
+                _host_command_cancellable(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    30, broker)
+            self.assertLess(time.monotonic() - started, 3)
+            timer.join(2)
+        finally:
+            caller.close()
+            broker.close()
+
     def test_web_restore_space_guard_precedes_any_docker_stop(self):
         target = self.manager.create()["id"]
         fake = mock.Mock(spec=RestoreOrchestrator)
@@ -764,3 +826,107 @@ class BackupApiTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 401)
         error.exception.close()
         self.host_backup.open_portable_stream.assert_not_called()
+
+    def test_portable_download_rechecks_access_after_broker_wait(self):
+        route = ("/api/v1/host-backups/operations/" + HOST_REQUEST_ID +
+                 "/portable/download-grants/archive")
+        download = route.replace("download-grants", "download")
+
+        for mode in ("logout", "downgrade"):
+            with self.subTest(mode=mode):
+                user = self.store.create_user("download-" + mode, PASSWORD, "admin")
+                token = self.request("POST", "/api/v1/session",
+                                     {"username": user["username"],
+                                      "password": PASSWORD})[1]["token"]
+                request = urllib.request.Request(
+                    self.base + route, data=b"{}", method="POST",
+                    headers={"Authorization": "Bearer " + token,
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(request) as response:
+                    cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                    response.read()
+
+                class Stream:
+                    size = 7
+                    sha256 = hashlib.sha256(b"payload").hexdigest()
+                    closed = False
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_args):
+                        self.closed = True
+
+                stream = Stream()
+
+                def opened(*_args, **_kwargs):
+                    if mode == "logout":
+                        self.store.logout(token)
+                    else:
+                        self.store.update_user(user["id"],
+                                               {"revision": user["revision"],
+                                                "role": "viewer"},
+                                               session_token=self.admin)
+                    return stream
+
+                self.host_backup.open_portable_stream.side_effect = opened
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(urllib.request.Request(
+                        self.base + download, headers={"Cookie": cookie}))
+                self.assertEqual(error.exception.code, 401)
+                error.exception.close()
+                self.assertTrue(stream.closed)
+                self.assertFalse(self.store.unrestricted_admin(token))
+                self.host_backup.open_portable_stream.side_effect = None
+
+    def test_portable_download_stops_after_session_revoked_midstream(self):
+        route = ("/api/v1/host-backups/operations/" + HOST_REQUEST_ID +
+                 "/portable/download-grants/archive")
+        user = self.store.create_user("download-midstream", PASSWORD, "admin")
+        token = self.request("POST", "/api/v1/session",
+                             {"username": user["username"],
+                              "password": PASSWORD})[1]["token"]
+        request = urllib.request.Request(
+            self.base + route, data=b"{}", method="POST",
+            headers={"Authorization": "Bearer " + token,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(request) as response:
+            cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+            response.read()
+
+        class Stream:
+            size = 10 * 131072
+            sha256 = "a" * 64
+
+            def __init__(self):
+                self.remaining = self.size
+                self.reads = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+            def read(self):
+                if self.remaining == 0:
+                    return b""
+                if self.reads == 8:
+                    self_store.logout(token)
+                self.reads += 1
+                self.remaining -= 131072
+                return b"a" * 131072
+
+        self_store = self.store
+        stream = Stream()
+        self.host_backup.open_portable_stream.return_value = stream
+        download = route.replace("download-grants", "download")
+        with urllib.request.urlopen(urllib.request.Request(
+                self.base + download, headers={"Cookie": cookie})) as response:
+            self.assertEqual(response.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as error:
+                response.read()
+        self.assertEqual(len(error.exception.partial), 8 * 131072)
+        self.assertTrue(stream.closed)
+        self.assertFalse(self.store.unrestricted_admin(token))
