@@ -29,6 +29,10 @@ from .public_settings import (PublicSettingsError, PublicSettingsExecutor,
                               validate_request as validate_public_request)
 from .local_settings import (LocalSettingsExecutor,
                              validate_request as validate_local_request)
+from .external_agent_control import (SCRIPT as EXTERNAL_SCRIPT,
+                                     valid_request as valid_external_request,
+                                     valid_result as valid_external_result)
+from .external_agent_operations import ExternalOperationError, ExternalOperationStore
 
 
 SOCKET_PATH = Path("/run/sovagrid-hub-backup/control.sock")
@@ -115,6 +119,10 @@ def _request(raw: bytes) -> dict:
             set(value) == {"action", "expected_state"} and
             isinstance(value["expected_state"], str) and
             FEED_SHA.fullmatch(value["expected_state"]) is not None):
+        return value
+    if action in ("external_status", "external_preview", "external_preflight",
+                  "external_apply", "external_operation_status",
+                  "external_operation_list") and valid_external_request(value):
         return value
     if action in ("public_status", "public_preview", "public_apply"):
         try:
@@ -273,18 +281,56 @@ def _feed_execute(payload: dict) -> dict:
     return {"ok": True, "status": value}
 
 
+def _external_execute(payload: dict) -> dict:
+    """Run only the installed reviewed updater with exact digest arguments."""
+    action = payload["action"]
+    if action == "external_apply":
+        # The backup broker is mounted read-only at /opt. The updater atomically
+        # exchanges /opt/sovagrid-agent and must run in its own fixed unit.
+        # Accept no mutating operation until that durable unit is installed.
+        raise BackupError("EXTERNAL_UNAVAILABLE")
+    arguments = [] if action == "external_status" else [
+        payload["archive_sha256"], payload["current_hub_manifest_sha256"]]
+    try:
+        result = subprocess.run(
+            ["/usr/bin/python3", "-B", "-I", str(EXTERNAL_SCRIPT),
+             action.removeprefix("external_"), *arguments],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=180, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    except subprocess.TimeoutExpired as exc:
+        raise BackupError("EXTERNAL_UNCERTAIN") from exc
+    except OSError as exc:
+        raise BackupError("EXTERNAL_UNAVAILABLE") from exc
+    if result.returncode != 0:
+        raise BackupError("EXTERNAL_REFUSED" if result.returncode == 40 else
+                          "EXTERNAL_UNAVAILABLE")
+    raw = result.stdout
+    if not 0 < len(raw) <= 32769 or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise BackupError("EXTERNAL_UNAVAILABLE")
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique)
+    except (UnicodeError, ValueError, BackupError) as exc:
+        raise BackupError("EXTERNAL_UNAVAILABLE") from exc
+    if not valid_external_result(action, value):
+        raise BackupError("EXTERNAL_UNAVAILABLE")
+    return {"ok": True, "result": value}
+
+
 class BackupBroker:
     def __init__(self, *, manager: HubBackups | None = None,
                  requests: Path = REQUESTS,
                  restores: RestoreOrchestrator | None = None,
                  public_web: PublicSettingsExecutor | None = None,
-                 local_web: LocalSettingsExecutor | None = None):
+                 local_web: LocalSettingsExecutor | None = None,
+                 external_operations: ExternalOperationStore | None = None):
         self.manager = HubBackups() if manager is None else manager
         self.requests = requests
         self.restores = (RestoreOrchestrator(manager=self.manager) if restores is None
                          else restores)
         self.public_web = PublicSettingsExecutor() if public_web is None else public_web
         self.local_web = LocalSettingsExecutor() if local_web is None else local_web
+        self.external_operations = (ExternalOperationStore() if external_operations is None
+                                    else external_operations)
         if requests.parent != self.manager.layout.backups:
             raise BackupError("INVALID_LEDGER_LAYOUT")
 
@@ -408,6 +454,22 @@ class BackupBroker:
             return _host_execute(payload)
         if action.startswith("feed_"):
             return _feed_execute(payload)
+        if action in ("external_apply", "external_operation_status", "external_operation_list"):
+            try:
+                if action == "external_apply":
+                    record = self.external_operations.apply(
+                        payload["request_id"], payload["archive_sha256"],
+                        payload["current_hub_manifest_sha256"],
+                        payload["external_agent_manifest_sha256"], payload["review_sha256"])
+                    return {"ok": True, "operation": record}
+                if action == "external_operation_status":
+                    return {"ok": True, "operation": self.external_operations.status(
+                        payload["request_id"])}
+                return {"ok": True, "operations": self.external_operations.list()}
+            except ExternalOperationError as exc:
+                raise BackupError(str(exc)) from exc
+        if action.startswith("external_"):
+            return _external_execute(payload)
         if action == "list":
             return {"ok": True, **self.manager.list()}
         if action == "verify":

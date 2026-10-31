@@ -1449,6 +1449,29 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             self._audit_account(db, identity, "release_feed_" + action + "_requested",
                                 details={"expected_state": expected_state})
 
+    def audit_external_agent_update_request(self, request_id: str, archive_sha256: str,
+                                            current_hub_manifest_sha256: str,
+                                            external_agent_manifest_sha256: str,
+                                            review_sha256: str, *,
+                                            session_token: str) -> None:
+        try:
+            if not isinstance(request_id, str) or str(uuid.UUID(request_id)) != request_id:
+                raise ValueError("Invalid external Agent update request")
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("Invalid external Agent update request") from exc
+        digests = {"archive_sha256": archive_sha256,
+                   "current_hub_manifest_sha256": current_hub_manifest_sha256,
+                   "external_agent_manifest_sha256": external_agent_manifest_sha256,
+                   "review_sha256": review_sha256}
+        if any(not isinstance(value, str) or
+               re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests.values()):
+            raise ValueError("Invalid external Agent update request")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            identity = self._require_unrestricted_admin(db, session_token)
+            self._audit_account(db, identity, "external_agent_update_apply_requested",
+                                subject_id=request_id, details=digests)
+
     def audit_public_web_request(self, action: str, config_sha256: str, *,
                                  request_id: str | None, session_token: str) -> None:
         try:

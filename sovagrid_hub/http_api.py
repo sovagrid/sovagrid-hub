@@ -46,8 +46,9 @@ from .vpn_status import read_vpn_status
 from .telegram_runtime import TelegramActivationError, TelegramModeError, TelegramStorageError
 from .server_acl import AccessConflict
 from .backup_client import (BackupBrokerClient, BackupClientError, HostBackupBrokerClient,
-                            ReleaseFeedBrokerClient,
+                            ReleaseFeedBrokerClient, ExternalAgentUpdateBrokerClient,
                             HOST_ID, HOST_SHA, canonical_id as backup_id)
+from .external_agent_operations import canonical_id as external_operation_id
 from .public_settings import (PublicSettingsClient, PublicSettingsClientError,
                               PublicSettingsError, PANEL_PATH, valid_hash as public_hash,
                               valid_id as public_id, validate_config as public_config)
@@ -62,7 +63,8 @@ BUNDLE_MANIFEST_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 class HubApp:
     def __init__(self, store: Store, telegram=None, trusted_proxies: set[str] | None = None,
                  vpn_status_path: str = "/vpn/status.json", backups=None, host_backups=None,
-                 public_web=None, local_web=None, release_feed=None):
+                 public_web=None, local_web=None, release_feed=None,
+                 external_agent_update=None):
         self.store = store
         # The image build pins this public digest. A missing or malformed pin
         # must never be reported as a compatible running Hub.
@@ -81,11 +83,14 @@ class HubApp:
         self.backups = BackupBrokerClient() if backups is None else backups
         self.host_backups = HostBackupBrokerClient() if host_backups is None else host_backups
         self.release_feed = ReleaseFeedBrokerClient() if release_feed is None else release_feed
+        self.external_agent_update = (ExternalAgentUpdateBrokerClient() if external_agent_update is None
+                                      else external_agent_update)
         self.public_web = PublicSettingsClient() if public_web is None else public_web
         self.local_web = LocalSettingsClient() if local_web is None else local_web
         self.backup_lock = threading.Lock()
         self.host_backup_lock = threading.Lock()
         self.release_feed_lock = threading.Lock()
+        self.external_agent_update_lock = threading.Lock()
         self.public_web_lock = threading.Lock()
         self.local_web_lock = threading.Lock()
         self._panel_location_lock = threading.Lock()
@@ -386,6 +391,7 @@ class HubHandler(BaseHTTPRequestHandler):
         global_admin = (path.startswith(("/api/v1/users", "/api/v1/telegram", "/api/v1/backups",
                                          "/api/v1/host-backups",
                                          "/api/v1/release-feed",
+                                         "/api/v1/external-agent-update",
                                          "/api/v1/public-web",
                                          "/api/v1/local-web",
                                          "/api/v1/agent-enrollments")) or
@@ -628,6 +634,52 @@ class HubHandler(BaseHTTPRequestHandler):
                 return
             try:
                 result = self.app.release_feed.status()
+                if not self.app.store.unrestricted_admin(self._token()):
+                    self._error(401, "Unauthorized")
+                    return
+                self._send(200, result)
+            except BackupClientError as exc:
+                self._error(exc.status, str(exc))
+            return
+        if url.path == "/api/v1/external-agent-update":
+            if not self._admin():
+                return
+            if url.query:
+                self._error(400, "INVALID_REQUEST")
+                return
+            try:
+                result = self.app.external_agent_update.status()
+                if not self.app.store.unrestricted_admin(self._token()):
+                    self._error(401, "Unauthorized")
+                    return
+                self._send(200, result)
+            except BackupClientError as exc:
+                self._error(exc.status, str(exc))
+            return
+        if url.path == "/api/v1/external-agent-update/operations":
+            if not self._admin():
+                return
+            if url.query:
+                self._error(400, "INVALID_REQUEST")
+                return
+            try:
+                result = self.app.external_agent_update.operations()
+                if not self.app.store.unrestricted_admin(self._token()):
+                    self._error(401, "Unauthorized")
+                    return
+                self._send(200, result)
+            except BackupClientError as exc:
+                self._error(exc.status, str(exc))
+            return
+        operation = re.fullmatch(r"/api/v1/external-agent-update/operations/([^/]+)", url.path)
+        if operation:
+            if not self._admin():
+                return
+            if url.query or not external_operation_id(operation.group(1)):
+                self._error(400, "INVALID_REQUEST")
+                return
+            try:
+                result = self.app.external_agent_update.operation_status(operation.group(1))
                 if not self.app.store.unrestricted_admin(self._token()):
                     self._error(401, "Unauthorized")
                     return
@@ -1130,6 +1182,54 @@ class HubHandler(BaseHTTPRequestHandler):
     def _post(self):
         self._body_auth = None
         path = urlsplit(self.path).path
+        if path in ("/api/v1/external-agent-update/preview",
+                    "/api/v1/external-agent-update/preflight",
+                    "/api/v1/external-agent-update/apply"):
+            if not self._admin() or not self._public_web_origin_ok():
+                return
+            if urlsplit(self.path).query:
+                self._error(400, "INVALID_REQUEST")
+                return
+            action = path.rsplit("/", 1)[1]
+            data = self._body(512, reject_duplicate_keys=True)
+            if data is None:
+                return
+            fields = {"archive_sha256", "current_hub_manifest_sha256"}
+            if action == "apply":
+                fields |= {"request_id", "external_agent_manifest_sha256", "review_sha256",
+                           "confirmed"}
+            if (not isinstance(data, dict) or set(data) != fields or
+                    (action == "apply" and data["confirmed"] is not True) or
+                    (action == "apply" and not external_operation_id(data["request_id"])) or
+                    any(not isinstance(data[name], str) or
+                        BUNDLE_MANIFEST_SHA256.fullmatch(data[name]) is None
+                        for name in fields - {"confirmed", "request_id"})):
+                self._error(400, "INVALID_REQUEST")
+                return
+            if not self.app.external_agent_update_lock.acquire(blocking=False):
+                self._error(409, "EXTERNAL_BUSY")
+                return
+            try:
+                if action == "apply":
+                    self.app.store.audit_external_agent_update_request(
+                        data["request_id"], data["archive_sha256"],
+                        data["current_hub_manifest_sha256"],
+                        data["external_agent_manifest_sha256"], data["review_sha256"],
+                        session_token=self._token())
+                arguments = [data["archive_sha256"], data["current_hub_manifest_sha256"]]
+                if action == "apply":
+                    arguments.insert(0, data["request_id"])
+                    arguments += [data["external_agent_manifest_sha256"], data["review_sha256"]]
+                result = getattr(self.app.external_agent_update, action)(*arguments)
+                if not self.app.store.unrestricted_admin(self._token()):
+                    self._error(401, "Unauthorized")
+                    return
+                self._send(200, result)
+            except BackupClientError as exc:
+                self._error(exc.status, str(exc))
+            finally:
+                self.app.external_agent_update_lock.release()
+            return
         if path in ("/api/v1/release-feed/enable", "/api/v1/release-feed/disable"):
             if not self._admin() or not self._public_web_origin_ok():
                 return

@@ -12,6 +12,9 @@ import uuid
 from datetime import datetime, timedelta
 
 from .backup_broker import MAX_RESPONSE, SOCKET_PATH, FEED_SHA, _feed_status_shape
+from .external_agent_control import valid_result as valid_external_result, valid_sha as valid_external_sha
+from .external_agent_operations import (canonical_id as external_operation_id,
+                                        valid_status as valid_external_operation)
 
 
 MAX_DATABASE_BYTES = 4 * 1024**3
@@ -138,6 +141,24 @@ class BackupBrokerClient:
                 raise BackupClientError(503, "TIMER_UNAVAILABLE")
             if code == "FEED_UNAVAILABLE":
                 raise BackupClientError(503, "FEED_UNAVAILABLE")
+            if code == "EXTERNAL_REFUSED":
+                raise BackupClientError(409, "EXTERNAL_REFUSED")
+            if code == "EXTERNAL_UNCERTAIN":
+                raise BackupClientError(503, "EXTERNAL_UNCERTAIN")
+            if code == "EXTERNAL_UNAVAILABLE":
+                raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
+            if code == "EXTERNAL_REQUEST_CONFLICT":
+                raise BackupClientError(409, "EXTERNAL_REQUEST_CONFLICT")
+            if code == "EXTERNAL_BUSY":
+                raise BackupClientError(409, "EXTERNAL_BUSY")
+            if code == "EXTERNAL_OPERATION_LIMIT":
+                raise BackupClientError(409, "EXTERNAL_OPERATION_LIMIT")
+            if code == "EXTERNAL_NOT_FOUND":
+                raise BackupClientError(404, "EXTERNAL_NOT_FOUND")
+            if code == "EXTERNAL_INVALID_REQUEST":
+                raise BackupClientError(400, "INVALID_REQUEST")
+            if code == "EXTERNAL_INVALID_STATE":
+                raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
             if code == "UPDATE_BUSY":
                 raise BackupClientError(503, "Server update or restore is busy")
             if code == "FILE_UNAVAILABLE":
@@ -367,3 +388,89 @@ class ReleaseFeedBrokerClient(BackupBrokerClient):
             raise BackupClientError(400, "INVALID_REQUEST")
         return self._status(self._feed_request({"action": "feed_disable", "expected_state": expected_state},
                                                timeout_seconds=115))
+
+
+class ExternalAgentUpdateBrokerClient(BackupBrokerClient):
+    """Exact-digest, metadata-only external Agent updater over the root socket."""
+
+    def _external(self, action: str, **digests: str) -> dict:
+        if not all(valid_external_sha(value) for value in digests.values()):
+            raise BackupClientError(400, "INVALID_REQUEST")
+        try:
+            value = self._request({"action": "external_" + action, **digests},
+                                  timeout_seconds=1240 if action == "apply" else 195)
+        except BackupClientError as exc:
+            if action == "apply" and exc.status == 503 and "may be uncertain" in str(exc):
+                raise BackupClientError(503, "EXTERNAL_UNCERTAIN") from exc
+            raise
+        result = value.get("result")
+        if set(value) != {"ok", "result"} or value["ok"] is not True or not valid_external_result(
+                "external_" + action, result):
+            raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
+        if ("current_hub_manifest_sha256" in digests and
+                result.get("current_hub_manifest_sha256", digests["current_hub_manifest_sha256"]) !=
+                digests["current_hub_manifest_sha256"]):
+            raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
+        if action == "preflight" and result["archive_sha256"] != digests["archive_sha256"]:
+            raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
+        if action == "apply" and (result["external_agent_manifest_sha256"] !=
+                                  digests["current_hub_manifest_sha256"] or
+                                  result["review_sha256"] != digests["review_sha256"]):
+            raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
+        return result
+
+    def status(self) -> dict:
+        return self._external("status")
+
+    def preview(self, archive_sha256: str, current_hub_manifest_sha256: str) -> dict:
+        return self._external("preview", archive_sha256=archive_sha256,
+                              current_hub_manifest_sha256=current_hub_manifest_sha256)
+
+    def preflight(self, archive_sha256: str, current_hub_manifest_sha256: str) -> dict:
+        return self._external("preflight", archive_sha256=archive_sha256,
+                              current_hub_manifest_sha256=current_hub_manifest_sha256)
+
+    @staticmethod
+    def _operation(value: dict, request_id: str) -> dict:
+        operation = value.get("operation")
+        if (set(value) != {"ok", "operation"} or value["ok"] is not True or
+                not valid_external_operation(operation, request_id=request_id)):
+            raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
+        return operation
+
+    def apply(self, request_id: str, archive_sha256: str,
+              current_hub_manifest_sha256: str, external_agent_manifest_sha256: str,
+              review_sha256: str) -> dict:
+        if not external_operation_id(request_id) or not all(valid_external_sha(value) for value in (
+                archive_sha256, current_hub_manifest_sha256,
+                external_agent_manifest_sha256, review_sha256)):
+            raise BackupClientError(400, "INVALID_REQUEST")
+        payload = {"action": "external_apply", "request_id": request_id,
+                   "archive_sha256": archive_sha256,
+                   "current_hub_manifest_sha256": current_hub_manifest_sha256,
+                   "external_agent_manifest_sha256": external_agent_manifest_sha256,
+                   "review_sha256": review_sha256}
+        try:
+            value = self._request(payload, timeout_seconds=30)
+        except BackupClientError as exc:
+            if exc.status == 503 and "may be uncertain" in str(exc):
+                raise BackupClientError(503, "EXTERNAL_UNCERTAIN") from exc
+            raise
+        return self._operation(value, request_id)
+
+    def operation_status(self, request_id: str) -> dict:
+        if not external_operation_id(request_id):
+            raise BackupClientError(400, "INVALID_REQUEST")
+        value = self._request({"action": "external_operation_status", "request_id": request_id},
+                              timeout_seconds=30)
+        return self._operation(value, request_id)
+
+    def operations(self) -> dict:
+        value = self._request({"action": "external_operation_list"}, timeout_seconds=30)
+        operations = value.get("operations")
+        if (set(value) != {"ok", "operations"} or value["ok"] is not True or
+                not isinstance(operations, list) or len(operations) > 64 or
+                not all(valid_external_operation(item) for item in operations) or
+                len({item["request_id"] for item in operations}) != len(operations)):
+            raise BackupClientError(503, "EXTERNAL_UNAVAILABLE")
+        return {"operations": operations}
