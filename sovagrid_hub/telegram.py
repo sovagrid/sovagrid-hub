@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import threading
 import time
 import urllib.error
@@ -33,7 +32,6 @@ class TelegramBot:
         self.opener = opener or urllib.request.build_opener(_RejectRedirect()).open
         self.vpn_status_path = vpn_status_path
         self.stop = threading.Event()
-        self.notifications = queue.Queue(maxsize=1000)
         self._incident_wake = threading.Event()
         self.offset = store.telegram_update_offset(self.token)
         self.threads: list[threading.Thread] = []
@@ -117,23 +115,55 @@ class TelegramBot:
         return text
 
     def enqueue_job_result(self, job: dict):
-        if not self.store.bot_server_allowed(job["actor_user_id"], job["chat_id"], job["server_id"], "admin"):
-            return
-        message = f"SovaGrid: задание {job['id']} завершено: {job['state']} (exit={job['exit_code']}).\nВывод: /result {job['id']}"
-        try:
-            self.notifications.put_nowait((job["chat_id"], message, job["server_id"]))
-            self._incident_wake.set()
-        except queue.Full:
-            logging.error("Telegram notification queue is full")
+        # finish_job committed the outbox row with the job result. This hint
+        # only wakes the sender; a restarted bot reads SQLite on its own.
+        self._incident_wake.set()
 
     def enqueue_pairing_result(self, chat_id: int, role: str | None):
-        message = (f"SovaGrid: доступ подтверждён, роль {role}. Отправьте /help."
-                   if role else "SovaGrid: запрос на подключение отклонён.")
+        # Approval/rejection and its notice were committed together.
+        self._incident_wake.set()
+
+    @staticmethod
+    def _notice_message(row: dict) -> str:
+        if row["kind"] == "job_result":
+            return (f"SovaGrid: задание {row['source_id']} завершено: {row['job_state']} "
+                    f"(exit={row['exit_code']}).\nВывод: /result {row['source_id']}")
+        if row["kind"] == "pairing_approved":
+            return f"SovaGrid: доступ подтверждён, роль {row['role']}. Отправьте /help."
+        return "SovaGrid: запрос на подключение отклонён."
+
+    def deliver_notice_once(self, now: int | None = None) -> bool:
+        """Send one durable job/pairing notice with current ACL rechecked."""
+        if self.stop.is_set():
+            return False
+        row = self.store.claim_telegram_notice(now=now)
+        if row is None:
+            return False
+        if self.stop.is_set():
+            self.store.retry_telegram_notice(row["id"], row["lease_generation"], now=now)
+            return True
+        if not self.store.telegram_notice_send_allowed(row["id"], row["lease_generation"], now=now):
+            return True
         try:
-            self.notifications.put_nowait((chat_id, message))
-            self._incident_wake.set()
-        except queue.Full:
-            logging.error("Telegram notification queue is full")
+            self.send_message(row["chat_id"], self._notice_message(row))
+        except urllib.error.HTTPError as exc:
+            permanent = exc.code in (400, 403, 410)
+            retry_after = self._retry_after(exc) if exc.code == 429 else None
+            try:
+                exc.close()
+            except Exception:
+                pass
+            self.store.retry_telegram_notice(row["id"], row["lease_generation"],
+                                             permanent=permanent, now=now,
+                                             retry_after=retry_after)
+            logging.error("Telegram notice delivery failed; %s",
+                          "dropped" if permanent else "retrying")
+        except Exception:
+            self.store.retry_telegram_notice(row["id"], row["lease_generation"], now=now)
+            logging.error("Telegram notice delivery failed; retrying")
+        else:
+            self.store.complete_telegram_notice(row["id"], row["lease_generation"], now=now)
+        return True
 
     @staticmethod
     def _retry_after(error: urllib.error.HTTPError) -> int | None:
@@ -191,29 +221,16 @@ class TelegramBot:
     def _send_loop(self):
         while not self.stop.is_set():
             try:
-                worked = self.deliver_incident_once()
+                incident = self.deliver_incident_once()
+                notice = self.deliver_notice_once()
             except Exception:
-                logging.error("Telegram incident outbox unavailable; retrying")
+                logging.error("Telegram outbox unavailable; retrying")
                 self._incident_wake.wait(5)
                 self._incident_wake.clear()
                 continue
-            try:
-                notification = self.notifications.get_nowait()
-                chat_id, message = notification[:2]
-            except queue.Empty:
-                if not worked:
-                    self._incident_wake.wait(1)
-                    self._incident_wake.clear()
-                continue
-            try:
-                if (not self.stop.is_set() and (len(notification) == 2 or
-                        self.store.bot_server_allowed(chat_id, chat_id, notification[2], "admin"))):
-                    self.send_message(chat_id, message)
-            except Exception:
-                # urllib exceptions can contain the bot token in a URL: never log them.
-                logging.error("Telegram notification delivery failed")
-            finally:
-                self.notifications.task_done()
+            if not incident and not notice:
+                self._incident_wake.wait(1)
+                self._incident_wake.clear()
 
     def _status(self, user_id=None, chat_id=None) -> str:
         servers = self.store.servers(bot=(user_id, chat_id) if user_id is not None else None)

@@ -260,6 +260,7 @@ class TelegramRuntime:
         result["bindings"] = self.store.bot_bindings()
         result["pending_requests"] = self.store.pending_bot_pairings()
         result["pending_incident_notifications"] = self.store.incident_outbox_pending_count()
+        result["pending_telegram_notices"] = self.store.telegram_notice_pending_count()
         return result
 
     def enqueue(self, events: list[dict]) -> None:

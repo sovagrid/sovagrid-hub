@@ -25,6 +25,7 @@ from .enrollment import EnrollmentStore, migrate_enrollments
 from .agent_management import AgentManagementStore, migrate_agent_management
 from .agent_maintenance import AgentMaintenanceStore, migrate_agent_maintenance
 from .server_acl import ServerACLStore, migrate_server_acl
+from .telegram_outbox import TelegramOutboxStore, migrate_telegram_outbox
 from .vpn_status import empty_vpn_status, project_vpn_status
 from .vpn_actions import HELPER as VPN_MARKER, is_vpn_command
 from .amnezia_actions import (HELPER as AMNEZIA_MARKER, control_status,
@@ -587,7 +588,7 @@ def root_inode_percent(details: dict) -> float | None:
 
 
 class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
-            EnrollmentStore, AgentManagementStore):
+            EnrollmentStore, AgentManagementStore, TelegramOutboxStore):
     def __init__(self, path: str | Path, *, offline_seconds: int = 120, thresholds: dict | None = None):
         self.path = str(path)
         self.offline_seconds = offline_seconds
@@ -1185,6 +1186,7 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             migrate_agent_management(db)
             migrate_agent_maintenance(db)
             migrate_server_acl(db)
+            migrate_telegram_outbox(db)
             db.execute("""CREATE TABLE IF NOT EXISTS vpn_inventory (
                 server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
                 received_at INTEGER NOT NULL,
@@ -1317,6 +1319,7 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
                 token_hash TEXT PRIMARY KEY, next_offset INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )""")
+            migrate_telegram_outbox(db)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(metrics)")}
             if "details_json" not in columns:
                 db.execute("ALTER TABLE metrics ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}' ")
@@ -2457,7 +2460,7 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             db.execute("BEGIN IMMEDIATE")
             identity = self._require_unrestricted_admin(db, session_token)
             self._prune_bot_pairings(db, now)
-            row = db.execute("""SELECT first_name, last_name, username FROM bot_pairing_requests
+            row = db.execute("""SELECT first_name, last_name, username, requested_at FROM bot_pairing_requests
                               WHERE user_id=? AND chat_id=? AND state='pending'""",
                              (user_id, chat_id)).fetchone()
             if row is None:
@@ -2472,6 +2475,9 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             db.execute("DELETE FROM bot_pairing_requests WHERE user_id=?", (user_id,))
             self._audit_account(db, identity, "bot_pairing_approved",
                         details={"user_id": user_id, "chat_id": chat_id, "role": role}, now=now)
+            self._queue_telegram_notice(db, kind="pairing_approved",
+                source_id=f"{user_id}:{row['requested_at']}", user_id=user_id,
+                chat_id=chat_id, role=role, pairing_requested_at=row["requested_at"], now=now)
             return {"user_id": user_id, "chat_id": chat_id, "role": role,
                     "first_name": row["first_name"], "last_name": row["last_name"],
                     "username": row["username"]}
@@ -2486,6 +2492,9 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             db.execute("BEGIN IMMEDIATE")
             identity = self._require_unrestricted_admin(db, session_token)
             self._prune_bot_pairings(db, now)
+            pending = db.execute("""SELECT requested_at FROM bot_pairing_requests
+                WHERE user_id=? AND chat_id=? AND state='pending'""",
+                (user_id, chat_id)).fetchone()
             changed = db.execute("""UPDATE bot_pairing_requests
                                  SET state='rejected', rejected_at=?
                                  WHERE user_id=? AND chat_id=? AND state='pending'""",
@@ -2493,6 +2502,9 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
             if changed:
                 self._audit_account(db, identity, "bot_pairing_rejected",
                             details={"user_id": user_id, "chat_id": chat_id}, now=now)
+                self._queue_telegram_notice(db, kind="pairing_rejected",
+                    source_id=f"{user_id}:{pending['requested_at']}", user_id=user_id,
+                    chat_id=chat_id, pairing_requested_at=pending["requested_at"], now=now)
             return changed
 
     def set_telegram_bot_info(self, token: str, username: str | None):
@@ -2564,6 +2576,9 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
                                  (user_id, chat_id)).rowcount != 0
             if removed:
                 db.execute("""UPDATE incident_outbox SET dropped_at=?, lease_until=NULL
+                              WHERE chat_id=? AND delivered_at IS NULL AND dropped_at IS NULL""",
+                           (int(time.time()), chat_id))
+                db.execute("""UPDATE telegram_notice_outbox SET dropped_at=?, lease_until=NULL
                               WHERE chat_id=? AND delivered_at IS NULL AND dropped_at IS NULL""",
                            (int(time.time()), chat_id))
                 self._audit_account(db, identity, "bot_binding_removed",
@@ -2968,6 +2983,12 @@ class Store(AgentMaintenanceStore, ServerACLStore, AccountStore, CheckStore,
                                (state, now, exit_code, "" if transient else output, job_id))
                     self._audit(db, f"agent:{server_id}", "command_completed", server_id, job_id,
                                 {"state": state, "exit_code": exit_code}, now=now)
+                    if (row["source"] == "telegram" and
+                            self._bot_allowed(db, row["actor_user_id"], row["chat_id"],
+                                              server_id, "admin")):
+                        self._queue_telegram_notice(db, kind="job_result", source_id=job_id,
+                            user_id=row["actor_user_id"], chat_id=row["chat_id"],
+                            server_id=server_id, now=now)
                 updated = db.execute("SELECT id, server_id, actor_user_id, chat_id, source, state, created_at, delivered_at, completed_at, exit_code, output FROM jobs WHERE id=?", (job_id,)).fetchone()
                 result = dict(updated) | {"just_completed": just_completed}
             if just_completed and transient:
