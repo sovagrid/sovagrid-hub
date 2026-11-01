@@ -19,6 +19,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from . import __version__
 from .auth import AuthenticationError, AuthorizationError, UserConflict, ROLES
 from .checks import CheckError
 from .enrollment import EnrollmentError
@@ -309,7 +310,7 @@ class HubApp:
 
 class HubHandler(BaseHTTPRequestHandler):
     app: HubApp
-    server_version = "SovaGridHub/0.1"
+    server_version = f"SovaGridHub/{__version__}"
     sys_version = ""
 
     def setup(self):
